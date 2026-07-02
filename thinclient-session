@@ -25,7 +25,7 @@ xsetroot -solid "#1a1a2e" 2>/dev/null || true
 unclutter -idle 5 -root &>/dev/null &
 
 echo "[$(date)] Launching thinclient-gui"
-/usr/local/bin/thinclient-gui
+/usr/local/bin/thinclient-gui 2>&1
 EXIT_CODE=$?
 
 echo "[$(date)] thinclient-gui exited with code $EXIT_CODE"

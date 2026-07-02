@@ -5,7 +5,7 @@
 # First login:  OOBE setup via xterm (host, user, password, save?)
 # Second login: fully automatic — authenticate + connect, no interaction
 
-set -e
+# No set -e — interactive script, errors handled explicitly
 
 CRED_FILE="$HOME/.thinclient_creds"
 CONFIG_DIR="$HOME/.config/thinclient"
