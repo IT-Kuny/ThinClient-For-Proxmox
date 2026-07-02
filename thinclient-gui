@@ -320,7 +320,7 @@ for vm in json.load(sys.stdin):
         --column="Node" \
         --column="RAM" \
         --column="Display" \
-        --width=600 --height=400 \
+        --width=1080 --height=720 \
         "${zenity_rows[@]}" 2>/dev/null) || do_logout
 
     [[ -z "$chosen" ]] && do_logout
@@ -426,7 +426,7 @@ post_session() {
         --column="Action" \
         "Connect to another VM" \
         "Logout" \
-        --width=400 --height=220 2>/dev/null) || choice="Logout"
+        --width=1080 --height=720 2>/dev/null) || choice="Logout"
 
     case "$choice" in
         "Connect to another VM")
