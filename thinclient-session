@@ -3,11 +3,17 @@
 # Launched by the display manager as the full X session
 
 export DISPLAY="${DISPLAY:-:0}"
+
+# Ensure XAUTHORITY is set for GDM sessions
+if [[ -z "$XAUTHORITY" ]]; then
+    export XAUTHORITY="$HOME/.Xauthority"
+fi
+
 LOGFILE="$HOME/.config/thinclient/session.log"
 mkdir -p "$HOME/.config/thinclient"
 
 exec > "$LOGFILE" 2>&1
-echo "[$(date)] thinclient-session started, DISPLAY=$DISPLAY"
+echo "[$(date)] thinclient-session started, DISPLAY=$DISPLAY, XAUTHORITY=$XAUTHORITY"
 
 # Wait for X to be ready
 for i in $(seq 1 10); do

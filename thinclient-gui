@@ -321,9 +321,9 @@ for vm in json.load(sys.stdin):
         --column="RAM" \
         --column="Display" \
         --width=600 --height=400 \
-        "${zenity_rows[@]}" 2>/dev/null) || exit 0
+        "${zenity_rows[@]}" 2>/dev/null) || do_logout
 
-    [[ -z "$chosen" ]] && die "No VM selected."
+    [[ -z "$chosen" ]] && do_logout
     VMID="$chosen"
 
     NODE=$(echo "$node_map" | awk -v id="$VMID" '$1==id {print $2; exit}')
@@ -404,12 +404,8 @@ connect_spice() {
 # ─── Logout / post-session ────────────────────────────────────────────────────
 
 do_logout() {
-    # Return to display manager cleanly
-    if [[ -n "$DISPLAY" ]]; then
-        kill "$PPID" 2>/dev/null || \
-        pkill -u "$USER" -f 'thinclient-session' 2>/dev/null || \
-        pkill -u "$USER" Xorg 2>/dev/null || true
-    fi
+    # Simply exit — GDM/LightDM/SDDM will return to login screen
+    # when the session process terminates cleanly
     exit 0
 }
 
