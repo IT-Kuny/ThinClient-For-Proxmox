@@ -30,6 +30,21 @@ fi
 xsetroot -solid "#1a1a2e" 2>/dev/null || true
 unclutter -idle 5 -root &>/dev/null &
 
+# Start minimal WM so zenity/xterm dialogs are centered properly
+if command -v openbox &>/dev/null; then
+    mkdir -p "$HOME/.config/openbox"
+    cp /usr/local/share/thinclient/openbox-rc.xml "$HOME/.config/openbox/rc.xml" 2>/dev/null || true
+    openbox --config-file "$HOME/.config/openbox/rc.xml" &
+    WM_PID=$!
+    echo "[$(date)] openbox started (PID $WM_PID)"
+    sleep 1
+elif command -v metacity &>/dev/null; then
+    metacity --replace &
+    WM_PID=$!
+    echo "[$(date)] metacity started (PID $WM_PID)"
+    sleep 1
+fi
+
 echo "[$(date)] Launching thinclient-gui"
 /usr/local/bin/thinclient-gui 2>&1
 EXIT_CODE=$?
