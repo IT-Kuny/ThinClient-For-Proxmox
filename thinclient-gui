@@ -1,0 +1,241 @@
+#!/bin/bash
+# thinclient-gui — Proxmox Thin Client with zenity GUI
+# Runs as X session, no WM required
+
+set -e
+
+CRED_FILE="$HOME/.thinclient_creds"
+CONFIG_DIR="$HOME/.config/thinclient"
+mkdir -p "$CONFIG_DIR"
+
+TITLE="Proxmox Thin Client"
+ICON_ERR="dialog-error"
+ICON_INFO="dialog-information"
+ICON_WARN="dialog-warning"
+
+# ─── Helper ───────────────────────────────────────────────────────────────────
+
+die() {
+    zenity --error --title="$TITLE" --text="$*" --icon-name="$ICON_ERR" 2>/dev/null || true
+    exit 1
+}
+
+info() {
+    zenity --info --title="$TITLE" --text="$*" --icon-name="$ICON_INFO" --timeout=3 2>/dev/null || true
+}
+
+ask_yn() {
+    zenity --question --title="$TITLE" --text="$*" 2>/dev/null
+}
+
+# ─── Credentials ──────────────────────────────────────────────────────────────
+
+load_credentials() {
+    if [[ -f "$CRED_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CRED_FILE"
+        # Ask if saved creds should be reused
+        if ! ask_yn "Use saved credentials?\n\nUser: <b>$USERNAME</b>\nHost: <b>$PROXY</b>"; then
+            rm -f "$CRED_FILE"
+            prompt_credentials
+        fi
+    else
+        prompt_credentials
+    fi
+}
+
+prompt_credentials() {
+    # Host
+    PROXY=$(zenity --entry \
+        --title="$TITLE" \
+        --text="Proxmox Host / IP:" \
+        --entry-text="pve.example.com" 2>/dev/null) || exit 0
+    [[ -z "$PROXY" ]] && die "Host cannot be empty."
+
+    # Username
+    USERNAME=$(zenity --entry \
+        --title="$TITLE" \
+        --text="Username (e.g. user@pam):" \
+        --entry-text="user@pam" 2>/dev/null) || exit 0
+    [[ -z "$USERNAME" ]] && die "Username cannot be empty."
+
+    # Password
+    PASSWORD=$(zenity --password \
+        --title="$TITLE" \
+        --text="Password:" 2>/dev/null) || exit 0
+    [[ -z "$PASSWORD" ]] && die "Password cannot be empty."
+
+    # Save?
+    if ask_yn "Save credentials for next login?\n\n⚠ Stored with restricted permissions (chmod 600)."; then
+        save_credentials
+    fi
+}
+
+save_credentials() {
+    # Preserve existing DEFAULT_VMID if present
+    local saved_vmid=""
+    [[ -f "$CRED_FILE" ]] && saved_vmid=$(grep '^DEFAULT_VMID=' "$CRED_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"' || true)
+
+    cat > "$CRED_FILE" <<EOF
+# ThinClient saved credentials — $(date)
+PROXY="$PROXY"
+USERNAME="$USERNAME"
+PASSWORD="$PASSWORD"
+EOF
+    [[ -n "$saved_vmid" ]] && echo "DEFAULT_VMID=$saved_vmid" >> "$CRED_FILE"
+    chmod 600 "$CRED_FILE"
+}
+
+# ─── Authenticate ─────────────────────────────────────────────────────────────
+
+authenticate() {
+    local response
+    response=$(curl -f -s -S -k \
+        --data-urlencode "username=$USERNAME" \
+        --data-urlencode "password=$PASSWORD" \
+        "https://$PROXY:8006/api2/json/access/ticket" 2>&1) \
+        || die "Authentication failed.\n\nCheck host and credentials."
+
+    TICKET=$(echo "$response" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(d['data']['ticket'])
+" 2>/dev/null) || die "Failed to parse auth ticket.\n\nServer response unexpected."
+
+    CSRF=$(echo "$response" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(d['data']['CSRFPreventionToken'])
+" 2>/dev/null) || die "Failed to parse CSRF token."
+}
+
+# ─── VM Selection ─────────────────────────────────────────────────────────────
+
+select_vm() {
+    local vm_data
+    vm_data=$(curl -f -s -S -k \
+        -b "PVEAuthCookie=$TICKET" \
+        -H "CSRFPreventionToken: $CSRF" \
+        "https://$PROXY:8006/api2/json/cluster/resources?type=vm" \
+        | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+vms = sorted(
+    [v for v in data if v.get('status') == 'running'],
+    key=lambda x: x.get('vmid', 0)
+)
+for vm in vms:
+    # zenity list format: col1 col2 col3 ...
+    print(str(vm.get('vmid','?')))
+    print(vm.get('name','(no name)'))
+    print(vm.get('node','?'))
+    print(vm.get('maxmem',0) // (1024**3))
+" 2>/dev/null)
+
+    [[ -z "$vm_data" ]] && die "No running VMs found.\n\nCheck your Proxmox permissions."
+
+    # Check for saved default
+    local default_vmid=""
+    [[ -f "$CRED_FILE" ]] && default_vmid=$(grep '^DEFAULT_VMID=' "$CRED_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"' || true)
+
+    # Build zenity list args
+    local chosen
+    chosen=$(echo "$vm_data" | zenity --list \
+        --title="$TITLE" \
+        --text="Select a VM to connect to:" \
+        --column="VM ID" \
+        --column="Name" \
+        --column="Node" \
+        --column="RAM (GB)" \
+        --width=500 --height=400 2>/dev/null) || exit 0
+
+    [[ -z "$chosen" ]] && die "No VM selected."
+
+    VMID="$chosen"
+
+    # Resolve node
+    NODE=$(curl -f -s -S -k \
+        -b "PVEAuthCookie=$TICKET" \
+        -H "CSRFPreventionToken: $CSRF" \
+        "https://$PROXY:8006/api2/json/cluster/resources?type=vm" \
+        | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+for vm in data:
+    if str(vm.get('vmid')) == '$VMID':
+        print(vm.get('node',''))
+        break
+" 2>/dev/null)
+    [[ -z "$NODE" ]] && die "Could not resolve node for VM $VMID."
+
+    # Save as default?
+    if [[ "$VMID" != "$default_vmid" ]]; then
+        if ask_yn "Set VM <b>$VMID</b> as default for next login?"; then
+            # Remove old default, append new
+            sed -i '/^DEFAULT_VMID=/d' "$CRED_FILE" 2>/dev/null || true
+            echo "DEFAULT_VMID=$VMID" >> "$CRED_FILE"
+        fi
+    fi
+}
+
+# ─── Connect ──────────────────────────────────────────────────────────────────
+
+connect_spice() {
+    local spice_file="$CONFIG_DIR/spiceproxy-$VMID.vv"
+
+    curl -f -s -S -k \
+        -b "PVEAuthCookie=$TICKET" \
+        -H "CSRFPreventionToken: $CSRF" \
+        "https://$PROXY:8006/api2/spiceconfig/nodes/$NODE/qemu/$VMID/spiceproxy" \
+        -X POST \
+        -d "proxy=$PROXY" \
+        > "$spice_file" \
+        || die "Failed to get SPICE config for VM $VMID.\n\nVM may not have SPICE display configured."
+
+    [[ ! -s "$spice_file" ]] && die "SPICE config is empty.\n\nEnable SPICE display on VM $VMID in Proxmox."
+
+    remote-viewer -f "$spice_file"
+    rm -f "$spice_file"
+}
+
+# ─── Logout / post-session ────────────────────────────────────────────────────
+
+post_session() {
+    local choice
+    choice=$(zenity --list \
+        --title="$TITLE" \
+        --text="VM session ended.\nWhat would you like to do?" \
+        --column="Action" \
+        "Connect to another VM" \
+        "Logout" 2>/dev/null) || choice="Logout"
+
+    case "$choice" in
+        "Connect to another VM")
+            # Re-auth (ticket may have expired) and re-select
+            authenticate
+            select_vm
+            connect_spice
+            post_session
+            ;;
+        *)
+            # Kill X session → returns to display manager login screen
+            if [[ -n "$DISPLAY" ]]; then
+                openbox --exit 2>/dev/null || \
+                pkill -u "$USER" Xorg 2>/dev/null || \
+                kill "$PPID" 2>/dev/null || true
+            fi
+            ;;
+    esac
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+main() {
+    load_credentials
+    authenticate
+    select_vm
+    connect_spice
+    post_session
+}
+
+main "$@"

@@ -1,0 +1,13 @@
+#!/bin/bash
+# thinclient-session — X session wrapper for GDM/LightDM/SDDM
+# Launched by the display manager as the full X session
+
+export DISPLAY="${DISPLAY:-:0}"
+
+# Basic X setup
+xsetroot -solid "#1a1a2e" 2>/dev/null || true
+# Hide cursor when idle (requires unclutter, optional)
+unclutter -idle 5 -root &>/dev/null &
+
+# Launch the GUI thin client
+exec /usr/local/bin/thinclient-gui

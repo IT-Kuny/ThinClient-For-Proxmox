@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Proxmox Thin Client
+Comment=Connect to a Proxmox VM via SPICE
+Exec=/usr/local/bin/thinclient-session
+TryExec=/usr/local/bin/thinclient-session
+Type=Application
+DesktopNames=proxmox-thinclient
