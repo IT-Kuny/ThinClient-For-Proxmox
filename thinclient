@@ -1,37 +1,256 @@
 #!/bin/bash
 set -e
 
-# Set auth options
-PASSWORD='proxuser'
-USERNAME='proxuser@pve'
+# ThinClient-For-Proxmox
+# Interactive login + VM selection + optional credential saving
+# Fork: IT-Kuny/ThinClient-For-Proxmox
 
-VMID="$1"
+CRED_FILE="$HOME/.thinclient_creds"
+CONFIG_DIR="$HOME/.config/thinclient"
+mkdir -p "$CONFIG_DIR"
 
-# Set Node as name of the node in the cluster
-NODE="pvehost"
+# ─── Helper ───────────────────────────────────────────────────────────────────
 
-# Set the IP address of the node here
-PROXY="$NODE"
+die() { echo "ERROR: $*" >&2; exit 1; }
 
-NODE="${NODE%%\.*}"
+ask_yn() {
+    local prompt="$1" default="${2:-n}"
+    local yn
+    read -rp "$prompt [y/N]: " yn
+    [[ "${yn,,}" == "y" ]]
+}
 
-DATA="$(curl -f -s -S -k --data-urlencode "username=$USERNAME" --data-urlencode "password=$PASSWORD" "https://$PROXY:8006/api2/json/access/ticket")"
+# ─── Load or prompt credentials ───────────────────────────────────────────────
 
-echo "AUTH OK"
+load_credentials() {
+    if [[ -f "$CRED_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CRED_FILE"
+        echo "→ Saved credentials loaded (user: $USERNAME, host: $PROXY)"
+        if ! ask_yn "Use these credentials?"; then
+            rm -f "$CRED_FILE"
+            prompt_credentials
+        fi
+    else
+        prompt_credentials
+    fi
+}
 
-TICKET="${DATA//\"/}"
-TICKET="${TICKET##*ticket:}"
-TICKET="${TICKET%%,*}"
-TICKET="${TICKET%%\}*}"
+prompt_credentials() {
+    echo ""
+    echo "╔══════════════════════════════════╗"
+    echo "║   Proxmox Thin Client Login      ║"
+    echo "╚══════════════════════════════════╝"
+    echo ""
 
-CSRF="${DATA//\"/}"
-CSRF="${CSRF##*CSRFPreventionToken:}"
-CSRF="${CSRF%%,*}"
-CSRF="${CSRF%%\}*}"
+    read -rp "Proxmox Host/IP (e.g. pve.example.com): " PROXY
+    [[ -z "$PROXY" ]] && die "Host cannot be empty"
 
-#curl -f -s -S -k -b "PVEAuthCookie=$TICKET" -H "CSRFPreventionToken: $CSRF" "https://$PROXY:8006/api2/spiceconfig/nodes/$NODE/qemu/$VMID/spiceproxy" -X POST > spiceproxy
-curl -f -s -S -k -b "PVEAuthCookie=$TICKET" -H "CSRFPreventionToken: $CSRF" "https://$PROXY:8006/api2/spiceconfig/nodes/$NODE/qemu/$VMID/spiceproxy" -X POST -d "proxy=$PROXY" > spiceproxy
+    read -rp "Username (e.g. user@pam or user@pve): " USERNAME
+    [[ -z "$USERNAME" ]] && die "Username cannot be empty"
 
-remote-viewer -f spiceproxy
+    read -rsp "Password: " PASSWORD
+    echo ""
+    [[ -z "$PASSWORD" ]] && die "Password cannot be empty"
 
-killall lxsession
+    if ask_yn "Save credentials for next login?"; then
+        save_credentials
+    fi
+}
+
+save_credentials() {
+    cat > "$CRED_FILE" <<EOF
+# ThinClient saved credentials - $(date)
+PROXY="$PROXY"
+USERNAME="$USERNAME"
+PASSWORD="$PASSWORD"
+EOF
+    chmod 600 "$CRED_FILE"
+    echo "→ Credentials saved to $CRED_FILE"
+}
+
+# ─── Authenticate against Proxmox API ─────────────────────────────────────────
+
+authenticate() {
+    echo ""
+    echo "→ Authenticating with $PROXY ..."
+
+    local response
+    response=$(curl -f -s -S -k \
+        --data-urlencode "username=$USERNAME" \
+        --data-urlencode "password=$PASSWORD" \
+        "https://$PROXY:8006/api2/json/access/ticket" 2>&1) \
+        || die "Authentication failed — check host/credentials"
+
+    # Parse ticket + CSRF
+    TICKET=$(echo "$response" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(d['data']['ticket'])
+" 2>/dev/null) || die "Failed to parse auth ticket"
+
+    CSRF=$(echo "$response" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(d['data']['CSRFPreventionToken'])
+" 2>/dev/null) || die "Failed to parse CSRF token"
+
+    echo "✓ Authentication successful"
+}
+
+# ─── Fetch available VMs ──────────────────────────────────────────────────────
+
+fetch_vms() {
+    echo "→ Fetching available VMs ..."
+
+    VM_LIST=$(curl -f -s -S -k \
+        -b "PVEAuthCookie=$TICKET" \
+        -H "CSRFPreventionToken: $CSRF" \
+        "https://$PROXY:8006/api2/json/cluster/resources?type=vm" \
+        | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+# Only running VMs, sorted by vmid
+vms = sorted(
+    [v for v in data if v.get('status') == 'running'],
+    key=lambda x: x.get('vmid', 0)
+)
+for vm in vms:
+    node = vm.get('node','?')
+    vmid = vm.get('vmid','?')
+    name = vm.get('name','(no name)')
+    print(f\"{vmid}  {name:<30}  [{node}]\")
+" 2>/dev/null)
+
+    if [[ -z "$VM_LIST" ]]; then
+        die "No running VMs found or access denied"
+    fi
+}
+
+# ─── Select VM ────────────────────────────────────────────────────────────────
+
+select_vm() {
+    # If VMID passed as argument, skip selection
+    if [[ -n "$1" ]]; then
+        VMID="$1"
+        # Resolve node for this VMID
+        NODE=$(curl -f -s -S -k \
+            -b "PVEAuthCookie=$TICKET" \
+            -H "CSRFPreventionToken: $CSRF" \
+            "https://$PROXY:8006/api2/json/cluster/resources?type=vm" \
+            | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+for vm in data:
+    if str(vm.get('vmid')) == '$VMID':
+        print(vm.get('node',''))
+        break
+" 2>/dev/null)
+        [[ -z "$NODE" ]] && die "VM $VMID not found or not accessible"
+        echo "→ Using VM $VMID on node $NODE"
+        return
+    fi
+
+    echo ""
+    echo "╔══════════════════════════════════════════════════════╗"
+    echo "║   Available VMs                                      ║"
+    echo "╠══════════════════════════════════════════════════════╣"
+    while IFS= read -r line; do
+        echo "║  $line"
+    done <<< "$VM_LIST"
+    echo "╚══════════════════════════════════════════════════════╝"
+    echo ""
+
+    read -rp "Enter VM ID to connect: " VMID
+    [[ -z "$VMID" ]] && die "No VM ID entered"
+    [[ ! "$VMID" =~ ^[0-9]+$ ]] && die "Invalid VM ID: $VMID"
+
+    # Resolve node
+    NODE=$(echo "$VM_LIST" | python3 -c "
+import sys
+for line in sys.stdin:
+    parts = line.split()
+    if parts and parts[0] == '$VMID':
+        # node is in brackets at end
+        node = line.strip().split('[')[-1].rstrip(']')
+        print(node)
+        break
+" 2>/dev/null)
+
+    # Fallback: query API directly
+    if [[ -z "$NODE" ]]; then
+        NODE=$(curl -f -s -S -k \
+            -b "PVEAuthCookie=$TICKET" \
+            -H "CSRFPreventionToken: $CSRF" \
+            "https://$PROXY:8006/api2/json/cluster/resources?type=vm" \
+            | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+for vm in data:
+    if str(vm.get('vmid')) == '$VMID':
+        print(vm.get('node',''))
+        break
+" 2>/dev/null)
+    fi
+
+    [[ -z "$NODE" ]] && die "VM $VMID not found or not running"
+
+    # Optional: save preferred VM
+    if ask_yn "Save VM $VMID as default for next session?"; then
+        echo "DEFAULT_VMID=$VMID" >> "$CRED_FILE"
+        echo "→ Default VM saved"
+    fi
+}
+
+# ─── Connect via SPICE ────────────────────────────────────────────────────────
+
+connect_spice() {
+    local spice_file="$CONFIG_DIR/spiceproxy-$VMID.vv"
+
+    echo ""
+    echo "→ Requesting SPICE session for VM $VMID on $NODE ..."
+
+    curl -f -s -S -k \
+        -b "PVEAuthCookie=$TICKET" \
+        -H "CSRFPreventionToken: $CSRF" \
+        "https://$PROXY:8006/api2/spiceconfig/nodes/$NODE/qemu/$VMID/spiceproxy" \
+        -X POST \
+        -d "proxy=$PROXY" \
+        > "$spice_file" \
+        || die "Failed to get SPICE config for VM $VMID"
+
+    [[ ! -s "$spice_file" ]] && die "SPICE config empty — VM may not support SPICE"
+
+    echo "✓ Connecting to VM $VMID ..."
+    remote-viewer -f "$spice_file"
+
+    # Cleanup
+    rm -f "$spice_file"
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+main() {
+    load_credentials
+    authenticate
+    fetch_vms
+
+    # Check for saved default VM
+    local default_vmid=""
+    if [[ -f "$CRED_FILE" ]]; then
+        default_vmid=$(grep '^DEFAULT_VMID=' "$CRED_FILE" | cut -d= -f2 | tr -d '"' || true)
+    fi
+
+    # CLI arg > saved default > interactive
+    local vmid_arg="${1:-$default_vmid}"
+    select_vm "$vmid_arg"
+
+    connect_spice
+
+    # Kill session after VM disconnect (kiosk behaviour)
+    if [[ -n "$DISPLAY" ]]; then
+        killall lxsession 2>/dev/null || true
+    fi
+}
+
+main "$@"
