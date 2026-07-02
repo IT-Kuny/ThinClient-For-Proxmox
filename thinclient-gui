@@ -76,24 +76,59 @@ print(d['data']['CSRFPreventionToken'])
     echo "✓ Authentication successful"
     echo ""
 
-    # Fetch + display VMs
+    # Fetch + display VMs with SPICE status
     echo "→ Fetching available VMs ..."
-    local vm_data
-    vm_data=$(curl -f -s -S -k \
+    local resources
+    resources=$(curl -f -s -S -k \
         -b "PVEAuthCookie=$TICKET" \
         -H "CSRFPreventionToken: $CSRF" \
-        "https://$PROXY:8006/api2/json/cluster/resources?type=vm" \
-        | python3 -c "
+        "https://$PROXY:8006/api2/json/cluster/resources?type=vm") \
+        || { echo "ERROR: Failed to fetch VM list."; sleep 3; exit 1; }
+
+    local vms_json
+    vms_json=$(echo "$resources" | python3 -c "
 import sys, json
 data = json.load(sys.stdin).get('data', [])
 vms = sorted([v for v in data if v.get('status') == 'running'], key=lambda x: x.get('vmid', 0))
-for vm in vms:
-    print(f\"  {vm.get('vmid','?'):<6} {vm.get('name','(no name)'):<30} [{vm.get('node','?')}]\")
+print(json.dumps(vms))
 " 2>/dev/null)
 
-    [[ -z "$vm_data" ]] && { echo "ERROR: No running VMs found."; sleep 3; exit 1; }
-    echo "Available VMs:"
-    echo "$vm_data"
+    [[ -z "$vms_json" || "$vms_json" == "[]" ]] && { echo "ERROR: No running VMs found."; sleep 3; exit 1; }
+
+    echo "Available VMs (checking SPICE ...)"
+    echo ""
+    printf "  %-6s %-30s %-15s %s\n" "VMID" "Name" "Node" "SPICE"
+    printf "  %s\n" "--------------------------------------------------------------"
+
+    local vm_list_oobe=""
+    while IFS= read -r line; do
+        local vmid node name
+        vmid=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('vmid','?'))")
+        node=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('node','?'))")
+        name=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('name','(no name)'))")
+        local spice
+        spice=$(curl -f -s -S -k \
+            -b "PVEAuthCookie=$TICKET" \
+            -H "CSRFPreventionToken: $CSRF" \
+            "https://$PROXY:8006/api2/json/nodes/$node/qemu/$vmid/config" \
+            | python3 -c "
+import sys, json
+d = json.load(sys.stdin).get('data', {})
+vga = d.get('vga', '')
+if isinstance(vga, str) and vga.startswith('qxl'):
+    print('✓ SPICE')
+elif 'spice' in str(d.get('args', '')):
+    print('✓ SPICE')
+else:
+    print('✗ No SPICE')
+" 2>/dev/null || echo "? unknown")
+        printf "  %-6s %-30s %-15s %s\n" "$vmid" "$name" "$node" "$spice"
+        vm_list_oobe+="$vmid|$name|$node|$spice"$'\n'
+    done < <(echo "$vms_json" | python3 -c "
+import sys, json
+for vm in json.load(sys.stdin):
+    print(json.dumps(vm))
+")
     echo ""
 
     read -rp "Default VM ID (leave empty to always ask): " DEFAULT_VMID
@@ -150,7 +185,6 @@ prompt_credentials() {
 }
 
 save_credentials() {
-    # Preserve existing DEFAULT_VMID if present
     local saved_vmid=""
     [[ -f "$CRED_FILE" ]] && saved_vmid=$(grep '^DEFAULT_VMID=' "$CRED_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"' || true)
 
@@ -164,18 +198,27 @@ EOF
     chmod 600 "$CRED_FILE"
 }
 
-save_credentials() {
-    local saved_vmid=""
-    [[ -f "$CRED_FILE" ]] && saved_vmid=$(grep '^DEFAULT_VMID=' "$CRED_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"' || true)
+# ─── SPICE detection ────────────────────────────────────────────────────────
+# Returns "yes" if VM has SPICE display configured, "no" otherwise
 
-    cat > "$CRED_FILE" <<EOF
-# ThinClient saved credentials — $(date)
-PROXY="$PROXY"
-USERNAME="$USERNAME"
-PASSWORD="$PASSWORD"
-EOF
-    [[ -n "$saved_vmid" ]] && echo "DEFAULT_VMID=$saved_vmid" >> "$CRED_FILE"
-    chmod 600 "$CRED_FILE"
+check_spice() {
+    local vmid="$1" node="$2"
+    curl -f -s -S -k \
+        -b "PVEAuthCookie=$TICKET" \
+        -H "CSRFPreventionToken: $CSRF" \
+        "https://$PROXY:8006/api2/json/nodes/$node/qemu/$vmid/config" \
+        | python3 -c "
+import sys, json
+d = json.load(sys.stdin).get('data', {})
+# SPICE: vga type is 'qxl' or 'qxl4', or spice=1 in args
+vga = d.get('vga', '')
+if isinstance(vga, str) and vga.startswith('qxl'):
+    print('yes')
+elif 'spice' in str(d.get('args', '')):
+    print('yes')
+else:
+    print('no')
+" 2>/dev/null || echo "no"
 }
 
 # ─── Authenticate ─────────────────────────────────────────────────────────────
@@ -232,52 +275,58 @@ for vm in data:
 }
 
 _select_vm_interactive() {
-    local vm_data
-    vm_data=$(curl -f -s -S -k \
+    # Fetch VMs with SPICE status for zenity list
+    local resources
+    resources=$(curl -f -s -S -k \
         -b "PVEAuthCookie=$TICKET" \
         -H "CSRFPreventionToken: $CSRF" \
-        "https://$PROXY:8006/api2/json/cluster/resources?type=vm" \
-        | python3 -c "
+        "https://$PROXY:8006/api2/json/cluster/resources?type=vm") \
+        || die "Failed to fetch VM list."
+
+    local vms_json
+    vms_json=$(echo "$resources" | python3 -c "
 import sys, json
 data = json.load(sys.stdin).get('data', [])
-vms = sorted(
-    [v for v in data if v.get('status') == 'running'],
-    key=lambda x: x.get('vmid', 0)
-)
-for vm in vms:
-    print(str(vm.get('vmid','?')))
-    print(vm.get('name','(no name)'))
-    print(vm.get('node','?'))
-    print(vm.get('maxmem',0) // (1024**3))
+vms = sorted([v for v in data if v.get('status') == 'running'], key=lambda x: x.get('vmid', 0))
+print(json.dumps(vms))
 " 2>/dev/null)
+    [[ -z "$vms_json" || "$vms_json" == "[]" ]] && die "No running VMs found.\n\nCheck your Proxmox permissions."
 
-    [[ -z "$vm_data" ]] && die "No running VMs found.\n\nCheck your Proxmox permissions."
+    # Build zenity rows: check SPICE per VM
+    local zenity_rows=()
+    local node_map=""
+    while IFS= read -r line; do
+        local vmid node name ram spice_status
+        vmid=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('vmid','?'))")
+        node=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('node','?'))")
+        name=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('name','(no name)'))")
+        ram=$(echo "$line"  | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('maxmem',0)//(1024**3))")
+        spice_status=$(check_spice "$vmid" "$node")
+        [[ "$spice_status" == "yes" ]] && spice_label="✓ SPICE" || spice_label="✗ No SPICE"
+        zenity_rows+=("$vmid" "$name" "$node" "${ram}GB" "$spice_label")
+        node_map+="$vmid $node"$'\n'
+    done < <(echo "$vms_json" | python3 -c "
+import sys, json
+for vm in json.load(sys.stdin):
+    print(json.dumps(vm))
+")
 
     local chosen
-    chosen=$(echo "$vm_data" | zenity --list \
+    chosen=$(zenity --list \
         --title="$TITLE" \
         --text="Select a VM to connect to:" \
         --column="VM ID" \
         --column="Name" \
         --column="Node" \
-        --column="RAM (GB)" \
-        --width=500 --height=400 2>/dev/null) || exit 0
+        --column="RAM" \
+        --column="Display" \
+        --width=600 --height=400 \
+        "${zenity_rows[@]}" 2>/dev/null) || exit 0
 
     [[ -z "$chosen" ]] && die "No VM selected."
     VMID="$chosen"
 
-    NODE=$(curl -f -s -S -k \
-        -b "PVEAuthCookie=$TICKET" \
-        -H "CSRFPreventionToken: $CSRF" \
-        "https://$PROXY:8006/api2/json/cluster/resources?type=vm" \
-        | python3 -c "
-import sys, json
-data = json.load(sys.stdin).get('data', [])
-for vm in data:
-    if str(vm.get('vmid')) == '$VMID':
-        print(vm.get('node',''))
-        break
-" 2>/dev/null)
+    NODE=$(echo "$node_map" | awk -v id="$VMID" '$1==id {print $2; exit}')
     [[ -z "$NODE" ]] && die "Could not resolve node for VM $VMID."
 
     # Offer to save as default
