@@ -341,48 +341,106 @@ for vm in json.load(sys.stdin):
 
 connect_spice() {
     local spice_file="$CONFIG_DIR/spiceproxy-$VMID.vv"
+    local error_msg=""
 
-    curl -f -s -S -k \
+    if ! curl -f -s -S -k \
         -b "PVEAuthCookie=$TICKET" \
         -H "CSRFPreventionToken: $CSRF" \
         "https://$PROXY:8006/api2/spiceconfig/nodes/$NODE/qemu/$VMID/spiceproxy" \
         -X POST \
         -d "proxy=$PROXY" \
-        > "$spice_file" \
-        || die "Failed to get SPICE config for VM $VMID.\n\nVM may not have SPICE display configured."
+        > "$spice_file" 2>/tmp/spice_err; then
+        error_msg="SPICE request failed (exit $?)\n$(cat /tmp/spice_err 2>/dev/null)"
+    elif [[ ! -s "$spice_file" ]]; then
+        error_msg="SPICE config empty — VM $VMID has no SPICE display configured."
+    fi
 
-    [[ ! -s "$spice_file" ]] && die "SPICE config is empty.\n\nEnable SPICE display on VM $VMID in Proxmox."
+    if [[ -n "$error_msg" ]]; then
+        rm -f "$spice_file"
+        # Show error in fullscreen xterm with Enter-prompt → menu
+        xterm -title "Proxmox Thin Client — Error" \
+            -fa 'Monospace' -fs 14 \
+            -fullscreen \
+            -e bash -c "
+ echo ''
+ echo '╔═════════════════════════════════════════════════════════╗'
+ echo '║  CONNECTION ERROR                          ║'
+ echo '╚═════════════════════════════════════════════════════════╝'
+ echo ''
+ echo '  VM: $VMID ($NODE)'
+ echo '  $error_msg'
+ echo ''
+ echo '  Press Enter to continue...'
+ read
+" 2>/dev/null
+        return 1
+    fi
 
     remote-viewer -f "$spice_file"
+    local rv_exit=$?
     rm -f "$spice_file"
+
+    if [[ $rv_exit -ne 0 ]]; then
+        xterm -title "Proxmox Thin Client — Error" \
+            -fa 'Monospace' -fs 14 \
+            -fullscreen \
+            -e bash -c "
+ echo ''
+ echo '╔═════════════════════════════════════════════════════════╗'
+ echo '║  VIEWER ERROR                               ║'
+ echo '╚═════════════════════════════════════════════════════════╝'
+ echo ''
+ echo '  remote-viewer exited with code $rv_exit'
+ echo ''
+ echo '  Press Enter to continue...'
+ read
+" 2>/dev/null
+        return 1
+    fi
+
+    return 0
 }
 
 # ─── Logout / post-session ────────────────────────────────────────────────────
 
+do_logout() {
+    # Return to display manager cleanly
+    if [[ -n "$DISPLAY" ]]; then
+        kill "$PPID" 2>/dev/null || \
+        pkill -u "$USER" -f 'thinclient-session' 2>/dev/null || \
+        pkill -u "$USER" Xorg 2>/dev/null || true
+    fi
+    exit 0
+}
+
 post_session() {
+    local connect_ok="$1"  # 0=success, 1=error
+
+    local text
+    if [[ "$connect_ok" == "1" ]]; then
+        text="Connection failed or closed unexpectedly.\nWhat would you like to do?"
+    else
+        text="VM session ended.\nWhat would you like to do?"
+    fi
+
     local choice
     choice=$(zenity --list \
         --title="$TITLE" \
-        --text="VM session ended.\nWhat would you like to do?" \
+        --text="$text" \
         --column="Action" \
         "Connect to another VM" \
-        "Logout" 2>/dev/null) || choice="Logout"
+        "Logout" \
+        --width=400 --height=220 2>/dev/null) || choice="Logout"
 
     case "$choice" in
         "Connect to another VM")
-            # Re-auth (ticket may have expired) and re-select
             authenticate
             select_vm
             connect_spice
-            post_session
+            post_session "$?"
             ;;
         *)
-            # Kill X session → returns to display manager login screen
-            if [[ -n "$DISPLAY" ]]; then
-                openbox --exit 2>/dev/null || \
-                pkill -u "$USER" Xorg 2>/dev/null || \
-                kill "$PPID" 2>/dev/null || true
-            fi
+            do_logout
             ;;
     esac
 }
@@ -420,7 +478,7 @@ main() {
     authenticate
     select_vm
     connect_spice
-    post_session
+    post_session "$?"
 }
 
 main "$@"
