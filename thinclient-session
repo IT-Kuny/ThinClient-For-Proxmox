@@ -3,11 +3,30 @@
 # Launched by the display manager as the full X session
 
 export DISPLAY="${DISPLAY:-:0}"
+LOGFILE="$HOME/.config/thinclient/session.log"
+mkdir -p "$HOME/.config/thinclient"
+
+exec > "$LOGFILE" 2>&1
+echo "[$(date)] thinclient-session started, DISPLAY=$DISPLAY"
+
+# Wait for X to be ready
+for i in $(seq 1 10); do
+    xdpyinfo &>/dev/null && break
+    sleep 0.5
+done
+
+if ! xdpyinfo &>/dev/null; then
+    echo "[$(date)] ERROR: X display not available, aborting"
+    exit 1
+fi
 
 # Basic X setup
 xsetroot -solid "#1a1a2e" 2>/dev/null || true
-# Hide cursor when idle (requires unclutter, optional)
 unclutter -idle 5 -root &>/dev/null &
 
-# Launch the GUI thin client
-exec /usr/local/bin/thinclient-gui
+echo "[$(date)] Launching thinclient-gui"
+/usr/local/bin/thinclient-gui
+EXIT_CODE=$?
+
+echo "[$(date)] thinclient-gui exited with code $EXIT_CODE"
+exit $EXIT_CODE

@@ -399,8 +399,8 @@ main() {
     # First run: no setup flag → launch xterm for OOBE, then re-exec GUI
     if [[ ! -f "$SETUP_DONE_FLAG" ]]; then
         xterm -title "Proxmox Thin Client Setup" \
-            -fa 'Monospace' -fs 12 \
-            -geometry 70x24 \
+            -fa 'Monospace' -fs 14 \
+            -fullscreen \
             -e bash -c "$0 --oobe; echo 'Press Enter to continue...'; read"
         # After OOBE: if setup completed, continue into GUI flow
         if [[ ! -f "$SETUP_DONE_FLAG" ]]; then
