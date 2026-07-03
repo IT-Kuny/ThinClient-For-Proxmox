@@ -12,6 +12,52 @@
     <keepBorder>yes</keepBorder>
     <animateIconify>yes</animateIconify>
   </theme>
+  <!-- Application-specific rules -->
+  <applications>
+    <!-- Browser kiosk (chromium / chromium-browser / google-chrome)
+         Place on layer=below so all dialogs render above it. -->
+    <application name="chromium">
+      <fullscreen>yes</fullscreen>
+      <layer>below</layer>
+    </application>
+    <application name="chromium-browser">
+      <fullscreen>yes</fullscreen>
+      <layer>below</layer>
+    </application>
+    <application name="google-chrome">
+      <fullscreen>yes</fullscreen>
+      <layer>below</layer>
+    </application>
+    <application name="google-chrome-stable">
+      <fullscreen>yes</fullscreen>
+      <layer>below</layer>
+    </application>
+    <!-- Match by class wildcard for any chromium-based browser -->
+    <application class="Chromium*">
+      <fullscreen>yes</fullscreen>
+      <layer>below</layer>
+    </application>
+    <application class="Google-chrome*">
+      <fullscreen>yes</fullscreen>
+      <layer>below</layer>
+    </application>
+    <!-- Zenity dialogs — always above the browser -->
+    <application name="zenity">
+      <layer>above</layer>
+    </application>
+    <application class="Zenity">
+      <layer>above</layer>
+    </application>
+    <!-- remote-viewer (SPICE) — top of everything once connected -->
+    <application name="remote-viewer">
+      <fullscreen>yes</fullscreen>
+      <layer>above</layer>
+    </application>
+    <application class="Remote-viewer">
+      <fullscreen>yes</fullscreen>
+      <layer>above</layer>
+    </application>
+  </applications>
   <keyboard>
     <keybind key="A-Escape">
       <action name="Exit"/>

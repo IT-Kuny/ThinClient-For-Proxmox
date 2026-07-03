@@ -86,26 +86,44 @@ print(d['data']['CSRFPreventionToken'])
         || { echo "ERROR: Failed to fetch VM list."; sleep 3; exit 1; }
 
     local vms_json
+    # Fetch node states to filter out VMs on offline nodes
+    local nodes_json
+    nodes_json=$(curl -f -s -S -k \
+        -b "PVEAuthCookie=$TICKET" \
+        -H "CSRFPreventionToken: $CSRF" \
+        "https://$PROXY:8006/api2/json/nodes" 2>/dev/null || echo '{"data":[]}')
+    local online_nodes
+    online_nodes=$(echo "$nodes_json" | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+print(' '.join(n.get('node','') for n in data if n.get('status') == 'online'))
+" 2>/dev/null)
+
     vms_json=$(echo "$resources" | python3 -c "
 import sys, json
 data = json.load(sys.stdin).get('data', [])
-vms = sorted([v for v in data if v.get('status') == 'running'], key=lambda x: x.get('vmid', 0))
+online = set('$online_nodes'.split())
+vms = sorted(
+    [v for v in data if v.get('status') in ('running','stopped') and v.get('node') in online],
+    key=lambda x: x.get('vmid', 0)
+)
 print(json.dumps(vms))
 " 2>/dev/null)
 
-    [[ -z "$vms_json" || "$vms_json" == "[]" ]] && { echo "ERROR: No running VMs found."; sleep 3; exit 1; }
+    [[ -z "$vms_json" || "$vms_json" == "[]" ]] && { echo "ERROR: No VMs found on online nodes."; sleep 3; exit 1; }
 
     echo "Available VMs (checking SPICE ...)"
     echo ""
-    printf "  %-6s %-30s %-15s %s\n" "VMID" "Name" "Node" "SPICE"
+    printf "  %-6s %-30s %-15s %-10s %s\n" "VMID" "Name" "Node" "Status" "SPICE"
     printf "  %s\n" "--------------------------------------------------------------"
 
     local vm_list_oobe=""
     while IFS= read -r line; do
-        local vmid node name
+        local vmid node name status
         vmid=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('vmid','?'))")
         node=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('node','?'))")
         name=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('name','(no name)'))")
+        status=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status','?'))")
         local spice
         spice=$(curl -f -s -S -k \
             -b "PVEAuthCookie=$TICKET" \
@@ -122,17 +140,13 @@ elif 'spice' in str(d.get('args', '')):
 else:
     print('✗ No SPICE')
 " 2>/dev/null || echo "? unknown")
-        printf "  %-6s %-30s %-15s %s\n" "$vmid" "$name" "$node" "$spice"
+        printf "  %-6s %-30s %-15s %-10s %s\n" "$vmid" "$name" "$node" "$status" "$spice"
         vm_list_oobe+="$vmid|$name|$node|$spice"$'\n'
     done < <(echo "$vms_json" | python3 -c "
 import sys, json
 for vm in json.load(sys.stdin):
     print(json.dumps(vm))
 ")
-    echo ""
-
-    read -rp "Default VM ID (leave empty to always ask): " DEFAULT_VMID
-
     echo ""
     read -rp "Save credentials for automatic login next time? [y/N]: " save_yn
     if [[ "${save_yn,,}" == "y" ]]; then
@@ -142,9 +156,33 @@ PROXY="$PROXY"
 USERNAME="$USERNAME"
 PASSWORD="$PASSWORD"
 EOF
-        [[ -n "$DEFAULT_VMID" ]] && echo "DEFAULT_VMID=$DEFAULT_VMID" >> "$CRED_FILE"
         chmod 600 "$CRED_FILE"
         echo "✓ Credentials saved."
+    fi
+
+    # Optional: enable VM autologin via Proxmox-mapped credentials
+    echo ""
+    echo "── VM Auto-Login (optional) ───────────────────────────────"
+    echo "If enabled, ThinClient will inject your Proxmox credentials"
+    echo "into the VM so you don't have to type them again at the VM login screen."
+    echo "Requires: pam_proxmox installed on the VM, map_<user> configured."
+    echo ""
+    read -rp "Enable VM autologin via Proxmox mapping? [y/N]: " autologin_yn
+    if [[ "${autologin_yn,,}" == "y" ]]; then
+        if grep -q '^AUTO_VM_LOGIN=' "$CRED_FILE" 2>/dev/null; then
+            sed -i '/^AUTO_VM_LOGIN=/d' "$CRED_FILE"
+        fi
+        echo "AUTO_VM_LOGIN=1" >> "$CRED_FILE"
+        echo "✓ VM autologin enabled."
+        echo ""
+        echo "To configure VM user mappings, run:"
+        echo "  thinclient-users add"
+    else
+        if grep -q '^AUTO_VM_LOGIN=' "$CRED_FILE" 2>/dev/null; then
+            sed -i '/^AUTO_VM_LOGIN=/d' "$CRED_FILE"
+        fi
+        echo "AUTO_VM_LOGIN=0" >> "$CRED_FILE"
+        echo "✓ VM autologin disabled — manual login required at VM login screen."
     fi
 
     touch "$SETUP_DONE_FLAG"
@@ -248,11 +286,14 @@ print(d['data']['CSRFPreventionToken'])
 # In auto mode (setup done + default VM saved): skip dialog entirely
 
 select_vm() {
-    # Auto-connect if default VM is set
-    local default_vmid=""
-    [[ -f "$CRED_FILE" ]] && default_vmid=$(grep '^DEFAULT_VMID=' "$CRED_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"' || true)
+    # Auto-connect only if user opted in (AUTO_RECONNECT=1) and default VM set
+    local default_vmid="" auto_reconnect=""
+    if [[ -f "$CRED_FILE" ]]; then
+        default_vmid=$(grep '^DEFAULT_VMID=' "$CRED_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"' || true)
+        auto_reconnect=$(grep '^AUTO_RECONNECT=' "$CRED_FILE" 2>/dev/null | cut -d= -f2 | tr -d '"' || true)
+    fi
 
-    if [[ -n "$default_vmid" && -f "$SETUP_DONE_FLAG" ]]; then
+    if [[ "$auto_reconnect" == "1" && -n "$default_vmid" && -f "$SETUP_DONE_FLAG" ]]; then
         VMID="$default_vmid"
         # Resolve node silently
         NODE=$(curl -f -s -S -k \
@@ -267,7 +308,7 @@ for vm in data:
         print(vm.get('node',''))
         break
 " 2>/dev/null)
-        [[ -z "$NODE" ]] && die "VM $VMID not found or not running."
+        [[ -z "$NODE" ]] && die "Default VM $VMID not found."
         return
     fi
 
@@ -275,6 +316,44 @@ for vm in data:
 }
 
 _select_vm_interactive() {
+    # Toggle state — whether to include VMs on offline nodes
+    local include_offline=0
+
+    while true; do
+        _render_vm_picker "$include_offline"
+        local rc=$?
+        # rc=0 → VM selected, rc=1 → cancel/logout, rc=42 → toggle offline
+        case $rc in
+            0) break ;;
+            42) include_offline=$(( 1 - include_offline )) ;;
+            *) do_logout ;;
+        esac
+    done
+
+    # Offer auto-reconnect setup (checkbox opt-in)
+    local choice
+    choice=$(zenity --list --checklist \
+        --title="$TITLE" \
+        --text="Optional: enable automatic reconnect to VM <b>$VMID</b>?\n\nIf enabled, next login will skip the VM picker and connect directly." \
+        --column="Enable" --column="Option" \
+        --width=560 --height=260 \
+        FALSE "Auto-reconnect to VM $VMID on next login" \
+        2>/dev/null || true)
+
+    if [[ "$choice" == *"Auto-reconnect"* ]]; then
+        sed -i '/^DEFAULT_VMID=/d;/^AUTO_RECONNECT=/d' "$CRED_FILE" 2>/dev/null || true
+        echo "DEFAULT_VMID=$VMID" >> "$CRED_FILE"
+        echo "AUTO_RECONNECT=1" >> "$CRED_FILE"
+        touch "$SETUP_DONE_FLAG"
+    else
+        # Ensure auto-reconnect stays off
+        sed -i '/^AUTO_RECONNECT=/d' "$CRED_FILE" 2>/dev/null || true
+    fi
+}
+
+_render_vm_picker() {
+    local include_offline="$1"
+
     # Fetch VMs with SPICE status for zenity list
     local resources
     resources=$(curl -f -s -S -k \
@@ -283,27 +362,67 @@ _select_vm_interactive() {
         "https://$PROXY:8006/api2/json/cluster/resources?type=vm") \
         || die "Failed to fetch VM list."
 
+    # Fetch node states
+    local nodes_json
+    nodes_json=$(curl -f -s -S -k \
+        -b "PVEAuthCookie=$TICKET" \
+        -H "CSRFPreventionToken: $CSRF" \
+        "https://$PROXY:8006/api2/json/nodes" 2>/dev/null || echo '{"data":[]}')
+    local online_nodes
+    online_nodes=$(echo "$nodes_json" | python3 -c "
+import sys, json
+data = json.load(sys.stdin).get('data', [])
+print(' '.join(n.get('node','') for n in data if n.get('status') == 'online'))
+" 2>/dev/null)
+
     local vms_json
     vms_json=$(echo "$resources" | python3 -c "
 import sys, json
 data = json.load(sys.stdin).get('data', [])
-vms = sorted([v for v in data if v.get('status') == 'running'], key=lambda x: x.get('vmid', 0))
+online = set('$online_nodes'.split())
+include_offline = $include_offline == 1
+vms = []
+for v in data:
+    if v.get('status') not in ('running','stopped'):
+        continue
+    node_online = v.get('node') in online
+    if not node_online and not include_offline:
+        continue
+    v['_node_online'] = node_online
+    vms.append(v)
+vms.sort(key=lambda x: x.get('vmid', 0))
 print(json.dumps(vms))
 " 2>/dev/null)
-    [[ -z "$vms_json" || "$vms_json" == "[]" ]] && die "No running VMs found.\n\nCheck your Proxmox permissions."
+    if [[ -z "$vms_json" || "$vms_json" == "[]" ]]; then
+        local msg="No VMs found on online nodes."
+        [[ "$include_offline" == "1" ]] && msg="No VMs found."
+        die "$msg\n\nCheck your Proxmox permissions."
+    fi
 
-    # Build zenity rows: check SPICE per VM
+    # Build zenity rows
     local zenity_rows=()
     local node_map=""
     while IFS= read -r line; do
-        local vmid node name ram spice_status
+        local vmid node name status ram spice_status node_online
         vmid=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('vmid','?'))")
         node=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('node','?'))")
         name=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('name','(no name)'))")
+        status=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status','?'))")
         ram=$(echo "$line"  | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('maxmem',0)//(1024**3))")
-        spice_status=$(check_spice "$vmid" "$node")
-        [[ "$spice_status" == "yes" ]] && spice_label="✓ SPICE" || spice_label="✗ No SPICE"
-        zenity_rows+=("$vmid" "$name" "$node" "${ram}GB" "$spice_label")
+        node_online=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('_node_online',True))")
+
+        # Skip SPICE check for offline nodes (would hang on curl timeout)
+        if [[ "$node_online" == "True" ]]; then
+            spice_status=$(check_spice "$vmid" "$node")
+            [[ "$spice_status" == "yes" ]] && spice_label="✓ SPICE" || spice_label="✗ No SPICE"
+            node_label="$node"
+        else
+            spice_label="—"
+            node_label="$node (offline)"
+            status="node-down"
+        fi
+
+        zenity_rows+=("$vmid" "$name" "$node_label" "$status" "${ram}GB" "$spice_label")
         node_map+="$vmid $node"$'\n'
     done < <(echo "$vms_json" | python3 -c "
 import sys, json
@@ -311,35 +430,492 @@ for vm in json.load(sys.stdin):
     print(json.dumps(vm))
 ")
 
+    local toggle_label
+    if [[ "$include_offline" == "1" ]]; then
+        toggle_label="Hide offline nodes"
+    else
+        toggle_label="Show offline nodes"
+    fi
+
+    local text="Select a VM to connect to:"
+    [[ "$include_offline" == "1" ]] && text="Select a VM to connect to (including offline nodes):"
+
     local chosen
     chosen=$(zenity --list \
         --title="$TITLE" \
-        --text="Select a VM to connect to:" \
+        --text="$text" \
         --column="VM ID" \
         --column="Name" \
         --column="Node" \
+        --column="Status" \
         --column="RAM" \
         --column="Display" \
         --width=1080 --height=720 \
-        "${zenity_rows[@]}" 2>/dev/null) || do_logout
+        --extra-button="$toggle_label" \
+        "${zenity_rows[@]}" 2>/dev/null)
+    local zrc=$?
 
-    [[ -z "$chosen" ]] && do_logout
+    # Zenity extra-button: prints label to stdout, exit code = 1
+    if [[ $zrc -ne 0 ]]; then
+        if [[ "$chosen" == "$toggle_label" ]]; then
+            return 42
+        fi
+        return 1
+    fi
+
+    [[ -z "$chosen" ]] && return 1
     VMID="$chosen"
-
     NODE=$(echo "$node_map" | awk -v id="$VMID" '$1==id {print $2; exit}')
     [[ -z "$NODE" ]] && die "Could not resolve node for VM $VMID."
 
-    # Offer to save as default
-    if ask_yn "Set VM <b>$VMID</b> as default for automatic login?"; then
-        sed -i '/^DEFAULT_VMID=/d' "$CRED_FILE" 2>/dev/null || true
-        echo "DEFAULT_VMID=$VMID" >> "$CRED_FILE"
-        touch "$SETUP_DONE_FLAG"
+    # Warn if user picked a VM on an offline node
+    if ! echo " $online_nodes " | grep -q " $NODE "; then
+        zenity --error --title="$TITLE" \
+            --text="Node <b>$NODE</b> is offline.\nCannot connect to VM $VMID." \
+            --width=400 2>/dev/null
+        return 42  # re-render picker
     fi
+
+    return 0
+}
+
+# ─── VM Power Management ─────────────────────────────────────────────────────
+
+ADS_INDEX="/var/lib/thinclient/ads/index.html"
+
+# Resolve chromium binary (different names across distros)
+_chromium_bin() {
+    for c in chromium chromium-browser google-chrome-stable google-chrome; do
+        if command -v "$c" >/dev/null 2>&1; then
+            echo "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Execute a command inside the VM via QEMU guest agent.
+# Echoes the exit code (0-255) or returns 1 on error.
+# Usage: _guest_exec <vmid> <node> <arg0> [arg1] [arg2] ...
+# Proxmox API expects: { "command": ["pgrep", "-x", "Xorg"] }
+_guest_exec() {
+    local vmid="$1" node="$2"
+    shift 2
+    [[ $# -eq 0 ]] && return 1
+
+    # Build JSON payload: {"command":["arg0","arg1",...]}
+    local payload
+    payload=$(python3 -c "
+import sys, json
+parts = sys.argv[1:]
+print(json.dumps({'command': parts}))
+" "$@")
+
+    local out pid exited rc i
+
+    out=$(curl -f -s -S -k \
+        -b "PVEAuthCookie=$TICKET" \
+        -H "CSRFPreventionToken: $CSRF" \
+        -H "Content-Type: application/json" \
+        -X POST \
+        --data "$payload" \
+        "https://$PROXY:8006/api2/json/nodes/$node/qemu/$vmid/agent/exec" 2>/dev/null) || return 1
+
+    pid=$(echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin).get('data',{}); print(d.get('pid','') if isinstance(d,dict) else (d if d else ''))" 2>/dev/null)
+    [[ -z "$pid" || "$pid" == "None" ]] && return 1
+
+    for i in $(seq 1 10); do
+        sleep 0.5
+        out=$(curl -f -s -S -k \
+            -b "PVEAuthCookie=$TICKET" \
+            -H "CSRFPreventionToken: $CSRF" \
+            "https://$PROXY:8006/api2/json/nodes/$node/qemu/$vmid/agent/exec-status?pid=$pid" 2>/dev/null) || continue
+        exited=$(echo "$out" | python3 -c "import sys,json; d=json.load(sys.stdin).get('data',{}); v=d.get('exited',False); print('True' if v and v != 'False' and v != '0' else 'False')" 2>/dev/null)
+        if [[ "$exited" == "True" ]]; then
+            rc=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('exitcode',1))" 2>/dev/null)
+            echo "${rc:-1}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_guest_ping() {
+    local vmid="$1" node="$2"
+    curl -f -s -S -k \
+        -b "PVEAuthCookie=$TICKET" \
+        -H "CSRFPreventionToken: $CSRF" \
+        -X POST \
+        "https://$PROXY:8006/api2/json/nodes/$node/qemu/$vmid/agent/ping" \
+        >/dev/null 2>&1
+}
+
+_vm_status() {
+    local vmid="$1" node="$2"
+    curl -f -s -S -k \
+        -b "PVEAuthCookie=$TICKET" \
+        -H "CSRFPreventionToken: $CSRF" \
+        "https://$PROXY:8006/api2/json/nodes/$node/qemu/$vmid/status/current" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('status','unknown'))" 2>/dev/null
+}
+
+_start_ads_kiosk() {
+    local browser
+    browser=$(_chromium_bin) || {
+        # Fallback: xterm black screen
+        xterm -fullscreen -bg black -fg grey -title "Loading…" \
+            -e bash -c 'while true; do sleep 1; done' 2>/dev/null &
+        echo $!
+        return 0
+    }
+
+    if [[ -f "$ADS_INDEX" ]]; then
+        # Use --start-fullscreen instead of --kiosk so the window is
+        # WM-managed (openbox can place zenity above it).
+        # --kiosk sets override-redirect which bypasses openbox entirely.
+        "$browser" \
+            --start-fullscreen \
+            --incognito \
+            --noerrdialogs \
+            --disable-translate \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-features=TranslateUI \
+            --disable-session-crashed-bubble \
+            --disable-restore-last-session \
+            --no-sandbox \
+            --disable-gpu \
+            --overscroll-history-navigation=0 \
+            "file://$ADS_INDEX" >>"$CONFIG_DIR/kiosk.log" 2>&1 &
+        echo $!
+        return 0
+    fi
+    xterm -fullscreen -bg black -fg grey -title "Loading…" \
+        -e bash -c 'while true; do sleep 1; done' 2>/dev/null &
+    echo $!
+}
+
+_kill_pid_tree() {
+    local pid="$1"
+    [[ -z "$pid" ]] && return
+    kill "$pid" 2>/dev/null || true
+    sleep 0.3
+    kill -9 "$pid" 2>/dev/null || true
+}
+
+vm_ensure_running() {
+    local vmid="$1" node="$2"
+
+    local status
+    status=$(_vm_status "$vmid" "$node")
+
+    # Already running — check if SPICE display is actually ready
+    if [[ "$status" == "running" ]]; then
+        if _guest_ping "$vmid" "$node"; then
+            local rc_check
+            rc_check=$(_guest_exec "$vmid" "$node" pgrep -x Xorg 2>/dev/null)
+            if [[ "$rc_check" == "0" ]]; then
+                return 0
+            fi
+        fi
+    fi
+
+    # Browser already running as global background session (KIOSK_PID).
+    # Just launch the progress zenity as an overlay.
+
+    # Status pipe: phase script writes "pct\nLabel" lines.
+    local status_fifo="/tmp/tc-status-$$"
+    mkfifo "$status_fifo"
+    (
+        zenity --progress \
+            --title="" \
+            --text="Preparing..." \
+            --percentage=0 \
+            --auto-close \
+            --width=400 --height=80 2>/dev/null
+    ) < "$status_fifo" &
+    status_pid=$!
+    exec 9>"$status_fifo"
+
+    _emit_phase() {
+        # $1 = percent, $2 = label
+        # zenity syntax: lines starting with '#' update text, plain numbers update percent
+        printf '#%s\n%s\n' "$2" "$1" >&9
+    }
+
+    # Initial phase label
+    if [[ "$status" == "running" ]]; then
+        _emit_phase 20 "VM $vmid already running — checking display..."
+    else
+        _emit_phase 5 "Starting VM $vmid on $node..."
+    fi
+
+    # Phase 1: Start VM via API
+    if [[ "$status" != "running" ]]; then
+        curl -f -s -S -k \
+            -b "PVEAuthCookie=$TICKET" \
+            -H "CSRFPreventionToken: $CSRF" \
+            -X POST \
+            "https://$PROXY:8006/api2/json/nodes/$node/qemu/$vmid/status/start" \
+            > /dev/null 2>&1
+    fi
+
+    _emit_phase 15 "Waiting for VM to enter running state..."
+    # Phase 2: Wait for VM status=running
+    local t0=$SECONDS
+    while true; do
+        status=$(_vm_status "$vmid" "$node")
+        [[ "$status" == "running" ]] && break
+        if (( SECONDS - t0 > 60 )); then
+            kill "$status_pid" 2>/dev/null || true
+            wait "$status_pid" 2>/dev/null || true
+            die "VM $vmid failed to enter running state within 60s."
+        fi
+        sleep 1
+    done
+
+    _emit_phase 35 "VM running. Waiting for guest agent..."
+    # Phase 3: Wait for guest agent
+    t0=$SECONDS
+    while ! _guest_ping "$vmid" "$node"; do
+        if (( SECONDS - t0 > 60 )); then
+            sleep 20
+            break
+        fi
+        sleep 1
+    done
+
+    _emit_phase 55 "Guest agent ready. Waiting for Xorg..."
+    # Phase 4: Wait for Xorg process inside VM
+    t0=$SECONDS
+    local xorg_ok=0
+    while true; do
+        local rc
+        rc=$(_guest_exec "$vmid" "$node" pgrep -x Xorg 2>/dev/null)
+        if [[ "$rc" == "0" ]]; then
+            xorg_ok=1
+            break
+        fi
+        if (( SECONDS - t0 > 45 )); then
+            break
+        fi
+        sleep 1
+    done
+
+    _emit_phase 75 "Xorg is up. Waiting for display manager..."
+    # Phase 5: Wait for display manager service active
+    t0=$SECONDS
+    local dm_ok=0
+    while true; do
+        local rc
+        rc=$(_guest_exec "$vmid" "$node" systemctl is-active --quiet lightdm 2>/dev/null)
+        if [[ "$rc" == "0" ]]; then
+            dm_ok=1
+            break
+        fi
+        rc=$(_guest_exec "$vmid" "$node" systemctl is-active --quiet gdm 2>/dev/null)
+        if [[ "$rc" == "0" ]]; then
+            dm_ok=1
+            break
+        fi
+        if (( SECONDS - t0 > 30 )); then
+            break
+        fi
+        sleep 1
+    done
+
+    _emit_phase 85 "Display manager active. Waiting for login..."
+
+    # Phase 6: Mode-dependent wait.
+    # AUTO_VM_LOGIN=1 + matching user config → wait for actual session
+    # Default → wait for greeter to be visible
+    local auto_vm=0
+    [[ -f "$CRED_FILE" ]] && grep -q '^AUTO_VM_LOGIN=1' "$CRED_FILE" && auto_vm=1
+
+    t0=$SECONDS
+    local login_ok=0
+    while true; do
+        local rc
+
+        if [[ "$auto_vm" == "1" ]]; then
+            # Autologin mode: wait for desktop session process
+            rc=$(_guest_exec "$vmid" "$node" pgrep -x startlxde 2>/dev/null)
+            [[ "$rc" == "0" ]] && { login_ok=1; break; }
+            rc=$(_guest_exec "$vmid" "$node" pgrep -f gnome-session 2>/dev/null)
+            [[ "$rc" == "0" ]] && { login_ok=1; break; }
+            rc=$(_guest_exec "$vmid" "$node" pgrep -f xfce4-session 2>/dev/null)
+            [[ "$rc" == "0" ]] && { login_ok=1; break; }
+            rc=$(_guest_exec "$vmid" "$node" pgrep -f plasmashell 2>/dev/null)
+            [[ "$rc" == "0" ]] && { login_ok=1; break; }
+        else
+            # Manual login mode: wait for greeter process to be visible
+            rc=$(_guest_exec "$vmid" "$node" pgrep -x lightdm-gtk-greeter 2>/dev/null)
+            [[ "$rc" == "0" ]] && { login_ok=1; break; }
+            rc=$(_guest_exec "$vmid" "$node" pgrep -f lightdm 2>/dev/null)
+            [[ "$rc" == "0" ]] && { login_ok=1; break; }
+            rc=$(_guest_exec "$vmid" "$node" pgrep -f gdm 2>/dev/null)
+            [[ "$rc" == "0" ]] && { login_ok=1; break; }
+            rc=$(_guest_exec "$vmid" "$node" pgrep -f sddm 2>/dev/null)
+            [[ "$rc" == "0" ]] && { login_ok=1; break; }
+        fi
+
+        if (( SECONDS - t0 > 30 )); then
+            break
+        fi
+        sleep 1
+    done
+
+    if [[ "$auto_vm" == "1" ]]; then
+        _emit_phase 95 "Desktop session ready. Opening SPICE connection..."
+    else
+        _emit_phase 95 "Login screen ready. Opening SPICE connection..."
+    fi
+    sleep 1
+
+    _emit_phase 100 "Connected."
+    # Teardown local progress dialog (browser stays alive)
+    exec 9>&-
+    rm -f "$status_fifo"
+    kill "$status_pid" 2>/dev/null || true
+    wait "$status_pid" 2>/dev/null || true
+
+    if [[ "$xorg_ok" != "1" ]]; then
+        zenity --warning \
+            --title="$TITLE" \
+            --text="VM is running but Xorg was not detected.\nSPICE connection may fail." \
+            --width=400 2>/dev/null
+    fi
+
+    return 0
+}
+
+
+vm_shutdown() {
+    local vmid="$1" node="$2"
+    
+    curl -f -s -S -k \
+        -b "PVEAuthCookie=$TICKET" \
+        -H "CSRFPreventionToken: $CSRF" \
+        -X POST \
+        "https://$PROXY:8006/api2/json/nodes/$node/qemu/$vmid/status/shutdown" \
+        > /dev/null 2>&1 || true
+}
+
+# ─── VM User Config ───────────────────────────────────────────────────────────
+
+VM_USERS_DIR="$HOME/.thinclient_vm_users"
+
+# Load VM user config by name
+# Sets: VM_USER_NAME, VM_USER_PASS, VM_USER_VMID
+load_vm_user() {
+    local name="$1"
+    local conf="$VM_USERS_DIR/$name.conf"
+    [[ ! -f "$conf" ]] && return 1
+    
+    VM_USER_NAME=$(grep '^USERNAME=' "$conf" | cut -d= -f2-)
+    VM_USER_PASS=$(grep '^PASSWORD=' "$conf" | cut -d= -f2-)
+    VM_USER_VMID=$(grep '^VMID=' "$conf" | cut -d= -f2-)
+}
+
+# Select VM user for a given VMID (zenity picker if multiple)
+select_vm_user() {
+    local target_vmid="$1"
+    
+    [[ ! -d "$VM_USERS_DIR" ]] && return 1
+    
+    local matching_users=()
+    local default_name=""
+    for f in "$VM_USERS_DIR"/*.conf; do
+        [[ ! -f "$f" ]] && continue
+        local name vmid user
+        name=$(basename "$f" .conf)
+        vmid=$(grep '^VMID=' "$f" | cut -d= -f2-)
+        user=$(grep '^USERNAME=' "$f" | cut -d= -f2-)
+        
+        if [[ -z "$target_vmid" || "$vmid" == "$target_vmid" ]]; then
+            matching_users+=("$name" "$user" "$vmid")
+            grep -q '^DEFAULT=yes' "$f" && default_name="$name"
+        fi
+    done
+    
+    [[ ${#matching_users[@]} -eq 0 ]] && return 1
+    
+    # If only one match, auto-select
+    if [[ ${#matching_users[@]} -eq 3 ]]; then
+        load_vm_user "${matching_users[0]}"
+        return 0
+    fi
+    
+    # Multiple: ask user
+    local chosen
+    chosen=$(zenity --list \
+        --title="$TITLE" \
+        --text="Select VM user:" \
+        --column="Config" \
+        --column="Username" \
+        --column="VM ID" \
+        --width=600 --height=400 \
+        "${matching_users[@]}" 2>/dev/null) || return 1
+    
+    load_vm_user "$chosen"
+}
+
+# Inject VM user credentials via QEMU Guest Agent
+vm_inject_credentials() {
+    local vmid="$1" node="$2" vm_user="$3" vm_pass="$4"
+    
+    # Build script to write inject file inside VM
+    local inject_script
+    inject_script=$(cat <<SCRIPT
+mkdir -p /var/run/pam-proxmox
+cat > /var/run/pam-proxmox/inject.conf <<CONF
+VM_USER=${vm_user}
+VM_PASS=${vm_pass}
+TIMESTAMP=
+CONF
+chmod 600 /var/run/pam-proxmox/inject.conf
+# Self-destruct after 5 minutes
+echo 'rm -f /var/run/pam-proxmox/inject.conf' | at now + 5 minutes 2>/dev/null || \
+  (sleep 300 && rm -f /var/run/pam-proxmox/inject.conf) &
+SCRIPT
+)
+    
+    # Encode script as base64 to avoid shell escaping issues
+    local b64_script
+    b64_script=$(echo "$inject_script" | base64 -w0)
+    
+    # Execute via guest agent
+    curl -f -s -S -k \
+        -b "PVEAuthCookie=$TICKET" \
+        -H "CSRFPreventionToken: $CSRF" \
+        -X POST \
+        --data-urlencode "command=execute" \
+        --data-urlencode "arg[]=bash" \
+        --data-urlencode "arg[]=-c" \
+        --data-urlencode "arg[]=echo $b64_script | base64 -d | bash" \
+        "https://$PROXY:8006/api2/json/nodes/$node/qemu/$vmid/agent/exec" \
+        > /dev/null 2>&1 || true
 }
 
 # ─── Connect ──────────────────────────────────────────────────────────────────
 
 connect_spice() {
+    # Ensure VM is running before attempting SPICE
+    if ! vm_ensure_running "$VMID" "$NODE"; then
+        return 1
+    fi
+
+    # Inject credentials if AUTO_VM_LOGIN is enabled AND a VM user
+    # config exists for this VM. Otherwise: manual login at the VM.
+    local auto_vm=0
+    [[ -f "$CRED_FILE" ]] && grep -q '^AUTO_VM_LOGIN=1' "$CRED_FILE" && auto_vm=1
+
+    if [[ "$auto_vm" == "1" ]]; then
+        if select_vm_user "$VMID"; then
+            vm_inject_credentials "$VMID" "$NODE" "$VM_USER_NAME" "$VM_USER_PASS"
+        fi
+    fi
+
     local spice_file="$CONFIG_DIR/spiceproxy-$VMID.vv"
     local error_msg=""
 
@@ -450,7 +1026,7 @@ main() {
         exit 0
     fi
 
-    # First run: no setup flag → launch xterm for OOBE, then re-exec GUI
+    # First run: no setup flag → launch xterm for OOBE, then re-exec GUI flow
     if [[ ! -f "$SETUP_DONE_FLAG" ]]; then
         xterm -title "Proxmox Thin Client Setup" \
             -fa 'Monospace' -fs 14 \
@@ -471,10 +1047,27 @@ main() {
         prompt_credentials
     fi
 
+    # Start ads browser as global background session — visible throughout
+    # the whole thinclient session (auth, VM list, boot wait, etc.).
+    # All zenity dialogs render above it via openbox layer=above rule.
+    KIOSK_PID=$(_start_ads_kiosk)
+    _trap_kiosk() {
+        _kill_pid_tree "$KIOSK_PID"
+    }
+    trap _trap_kiosk EXIT INT TERM
+
+    # Give browser a moment to take the screen before zenity dialogs appear
+    sleep 1
+
     authenticate
     select_vm
     connect_spice
-    post_session "$?"
+    rc=$?
+
+    # Kill browser before post-session dialog so it doesn't show through
+    _trap_kiosk
+
+    post_session "$rc"
 }
 
 main "$@"

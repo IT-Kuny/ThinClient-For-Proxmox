@@ -1,0 +1,172 @@
+#!/bin/bash
+# thinclient-users — manage VM User configurations for ThinClient
+#
+# Usage:
+#   thinclient-users add <name> <vmid> <username> [--default]
+#   thinclient-users list
+#   thinclient-users edit <name>
+#   thinclient-users delete <name>
+#   thinclient-users set-default <name>
+#
+# Storage: ~/.thinclient_vm_users/<name>.conf (chmod 600)
+# Format:
+#   VMID=300
+#   USERNAME=hx
+#   PASSWORD=...
+#   DEFAULT=yes  (optional)
+
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.thinclient_vm_users"
+mkdir -p "$CONFIG_DIR"
+
+usage() {
+    cat <<EOF
+Usage: thinclient-users <command> [args]
+
+Commands:
+  add <name> <vmid> <username> [--default]   Add new VM user
+  list                                       List all VM users
+  edit <name>                                Edit VM user (opens \$EDITOR)
+  delete <name>                              Delete VM user
+  set-default <name>                         Mark VM user as default
+  show <name>                                Show VM user config (masked)
+
+Examples:
+  thinclient-users add hx 300 hx --default
+  thinclient-users add admin 301 admin
+  thinclient-users list
+  thinclient-users set-default hx
+EOF
+}
+
+gen_password_hash_placeholder() {
+    # We store plaintext because pam_proxmox needs it for API auth
+    # The file is chmod 600 user-only
+    echo "(stored plaintext, file is chmod 600)"
+}
+
+cmd_add() {
+    local name="$1" vmid="$2" username="$3"
+    shift 3
+    local make_default=""
+    [[ "${1:-}" == "--default" ]] && make_default="yes"
+
+    if [[ -z "$name" || -z "$vmid" || -z "$username" ]]; then
+        echo "Error: name, vmid, username required"
+        usage
+        exit 1
+    fi
+
+    local conf_file="$CONFIG_DIR/$name.conf"
+    if [[ -f "$conf_file" ]]; then
+        echo "Error: VM user '$name' already exists"
+        exit 1
+    fi
+
+    # Validate vmid is numeric
+    [[ ! "$vmid" =~ ^[0-9]+$ ]] && { echo "Error: vmid must be numeric"; exit 1; }
+
+    # Prompt for password (twice)
+    local pass1 pass2
+    read -rsp "VM User password: " pass1; echo ""
+    read -rsp "Confirm password: " pass2; echo ""
+    [[ "$pass1" != "$pass2" ]] && { echo "Error: passwords don't match"; exit 1; }
+    [[ -z "$pass1" ]] && { echo "Error: password cannot be empty"; exit 1; }
+
+    # If making default, remove DEFAULT from others
+    if [[ "$make_default" == "yes" ]]; then
+        for f in "$CONFIG_DIR"/*.conf; do
+            [[ -f "$f" ]] && sed -i '/^DEFAULT=/d' "$f"
+        done
+    fi
+
+    cat > "$conf_file" <<EOF
+# ThinClient VM User Config — $(date)
+VMID=$vmid
+USERNAME=$username
+PASSWORD=***
+${make_default:+DEFAULT=yes}
+EOF
+    chmod 600 "$conf_file"
+
+    echo "✓ VM user '$name' added (vmid=$vmid, username=$username)"
+    [[ "$make_default" == "yes" ]] && echo "✓ Marked as default"
+}
+
+cmd_list() {
+    echo "VM User Configurations"
+    echo "======================"
+    echo ""
+    local found=0
+    for f in "$CONFIG_DIR"/*.conf; do
+        [[ ! -f "$f" ]] && continue
+        found=1
+        # shellcheck source=/dev/null
+        source "$f"
+        local name
+        name=$(basename "$f" .conf)
+        local default_marker=""
+        [[ "${DEFAULT:-}" == "yes" ]] && default_marker=" ★"
+        printf "  %-15s VMID=%-6s User=%-15s%s\n" "$name" "$VMID" "$USERNAME" "$default_marker"
+    done
+    [[ "$found" == "0" ]] && echo "  (none)"
+}
+
+cmd_edit() {
+    local name="$1"
+    local conf_file="$CONFIG_DIR/$name.conf"
+    [[ ! -f "$conf_file" ]] && { echo "Error: '$name' not found"; exit 1; }
+    "${EDITOR:-nano}" "$conf_file"
+    echo "✓ Edited '$name'"
+}
+
+cmd_delete() {
+    local name="$1"
+    local conf_file="$CONFIG_DIR/$name.conf"
+    [[ ! -f "$conf_file" ]] && { echo "Error: '$name' not found"; exit 1; }
+    rm -i "$conf_file"
+    echo "✓ Deleted '$name'"
+}
+
+cmd_set_default() {
+    local name="$1"
+    local conf_file="$CONFIG_DIR/$name.conf"
+    [[ ! -f "$conf_file" ]] && { echo "Error: '$name' not found"; exit 1; }
+
+    # Remove DEFAULT from all
+    for f in "$CONFIG_DIR"/*.conf; do
+        [[ -f "$f" ]] && sed -i '/^DEFAULT=/d' "$f"
+    done
+
+    # Add to target
+    echo "DEFAULT=yes" >> "$conf_file"
+    echo "✓ '$name' set as default"
+}
+
+cmd_show() {
+    local name="$1"
+    local conf_file="$CONFIG_DIR/$name.conf"
+    [[ ! -f "$conf_file" ]] && { echo "Error: '$name' not found"; exit 1; }
+
+    # shellcheck source=/dev/null
+    source "$conf_file"
+    echo "Name:    $name"
+    echo "VMID:    $VMID"
+    echo "User:    $USERNAME"
+    echo "Pass:    ********"
+    [[ "${DEFAULT:-}" == "yes" ]] && echo "Default: yes"
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    add)         shift; cmd_add "$@";;
+    list)        cmd_list;;
+    edit)        shift; cmd_edit "$@";;
+    delete)      shift; cmd_delete "$@";;
+    set-default) shift; cmd_set_default "$@";;
+    show)        shift; cmd_show "$@";;
+    help|"")     usage;;
+    *)           echo "Unknown command: $1"; usage; exit 1;;
+esac

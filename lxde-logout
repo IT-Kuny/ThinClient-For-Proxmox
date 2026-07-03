@@ -1,0 +1,59 @@
+#!/bin/bash
+# lxde-logout — replaced logout action for Thin Client VMs
+# Triggers VM shutdown instead of session logout
+
+# Show confirmation dialog
+zenity --question \
+    --title="Abmelden" \
+    --text="Möchtest du dich abmelden?\n\nDie VM wird heruntergefahren und du kehrst zum Thin Client Menü." \
+    --width=400 2>/dev/null
+
+if [[ $? -ne 0 ]]; then
+    exit 0
+fi
+
+CRED_FILE="$HOME/.thinclient_creds"
+if [[ ! -f "$CRED_FILE" ]]; then
+    systemctl poweroff 2>/dev/null || true
+    exit 0
+fi
+
+source "$CRED_FILE"
+
+# Get ticket
+RESPONSE=$(curl -f -s -S -k \
+    --data-urlencode "username=$USERNAME" \
+    --data-urlencode "password=***" \
+    "https://$PROXY:8006/api2/json/access/ticket" 2>/dev/null)
+
+TICKET=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['ticket'])" 2>/dev/null)
+CSRF=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['CSRFPreventionToken'])" 2>/dev/null)
+
+# Find this VM's ID and node by hostname match
+VM_INFO=$(curl -f -s -S -k \
+    -b "PVEAuthCookie=$TICKET" \
+    -H "CSRFPreventionToken: $CSRF" \
+    "https://$PROXY:8006/api2/json/cluster/resources?type=vm" \
+    | python3 -c "
+import sys, json, socket
+data = json.load(sys.stdin).get('data', [])
+hostname = socket.gethostname()
+for vm in data:
+    if vm.get('name') == hostname:
+        print(vm.get('vmid'), vm.get('node'))
+        break
+" 2>/dev/null)
+
+VMID=$(echo "$VM_INFO" | awk '{print $1}')
+NODE=$(echo "$VM_INFO" | awk '{print $2}')
+
+if [[ -n "$VMID" && -n "$NODE" ]]; then
+    curl -f -s -S -k \
+        -b "PVEAuthCookie=$TICKET" \
+        -H "CSRFPreventionToken: $CSRF" \
+        -X POST \
+        "https://$PROXY:8006/api2/json/nodes/$NODE/qemu/$VMID/status/shutdown" \
+        > /dev/null 2>&1
+else
+    systemctl poweroff 2>/dev/null || true
+fi

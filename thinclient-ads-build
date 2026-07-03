@@ -1,0 +1,546 @@
+#!/usr/bin/env python3
+"""
+thinclient-ads-build — Generate kiosk HTML ad page from GitHub org READMEs
+
+Fetches all public repositories from a GitHub organization (default:
+IT-Kuny) and renders each project's README.md as a slide in a
+self-contained rotating kiosk page.
+
+Output: /var/lib/thinclient/ads/index.html
+
+Config: /etc/thinclient/ads.conf
+    org=IT-Kuny
+    rotate_interval=10
+    github_token=ghp_...        # optional, raises rate limit
+    repos=/path1:/path2         # optional, adds local repos to the deck
+    include_forked=false       # default: skip forks
+    include_archived=false     # default: skip archived
+
+Usage:
+    sudo thinclient-ads-build                 # build once
+    sudo thinclient-ads-build --org IT-Kuny   # override org
+    sudo thinclient-ads-build --local-only    # ignore GitHub, use repos= only
+"""
+
+import argparse
+import html
+import json
+import os
+import re
+import sys
+import urllib.request
+from pathlib import Path
+
+
+DEFAULT_CONFIG = "/etc/thinclient/ads.conf"
+DEFAULT_OUTPUT = "/var/lib/thinclient/ads/index.html"
+DEFAULT_ORG = "IT-Kuny"
+DEFAULT_ROTATE_SEC = 10
+GITHUB_API = "https://api.github.com"
+GITHUB_RAW = "https://raw.githubusercontent.com"
+
+
+def load_config(path):
+    cfg = {
+        "org": DEFAULT_ORG,
+        "rotate": DEFAULT_ROTATE_SEC,
+        "token": "",
+        "repos": [],
+        "include_forked": False,
+        "include_archived": False,
+    }
+    if not os.path.isfile(path):
+        return cfg
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("org="):
+                cfg["org"] = line.split("=", 1)[1].strip()
+            elif line.startswith("rotate_interval="):
+                try:
+                    cfg["rotate"] = int(line.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif line.startswith("github_token="):
+                cfg["token"] = line.split("=", 1)[1].strip()
+            elif line.startswith("repos="):
+                cfg["repos"] = [p for p in line.split("=", 1)[1].split(":") if p]
+            elif line.startswith("include_forked="):
+                cfg["include_forked"] = line.split("=", 1)[1].strip().lower() in ("1", "true", "yes")
+            elif line.startswith("include_archived="):
+                cfg["include_archived"] = line.split("=", 1)[1].strip().lower() in ("1", "true", "yes")
+    return cfg
+
+
+def github_api_get(path, token=""):
+    url = f"{GITHUB_API}{path}"
+    req = urllib.request.Request(url)
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("User-Agent", "thinclient-ads-build")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8")), dict(resp.headers)
+    except Exception as e:
+        print(f"  github API error: {e}", file=sys.stderr)
+        return None, {}
+
+
+def fetch_org_repos(org, token="", include_forked=False, include_archived=False):
+    """Return list of repo metadata dicts."""
+    repos = []
+    page = 1
+    while True:
+        q = f"/orgs/{org}/repos?per_page=100&page={page}&type=public"
+        data, headers = github_api_get(q, token)
+        if data is None:
+            break
+        if not data:
+            break
+        for r in data:
+            if r.get("fork") and not include_forked:
+                continue
+            if r.get("archived") and not include_archived:
+                continue
+            repos.append({
+                "name": r.get("name", "?"),
+                "description": r.get("description") or "",
+                "html_url": r.get("html_url", ""),
+                "default_branch": r.get("default_branch", "main"),
+                "topics": r.get("topics", []),
+                "language": r.get("language") or "",
+                "stars": r.get("stargazers_count", 0),
+            })
+        remaining = headers.get("X-RateLimit-Remaining")
+        if remaining == "0":
+            print(f"  GitHub rate limit hit after {len(repos)} repos", file=sys.stderr)
+            break
+        if len(data) < 100:
+            break
+        page += 1
+    return repos
+
+
+def fetch_readme_raw(org, repo, branch, token=""):
+    """Fetch README via raw.githubusercontent.com (no API rate limit cost)."""
+    candidates = ["README.md", "README.md", "readme.md", "README.rst", "README"]
+    for fname in candidates:
+        url = f"{GITHUB_RAW}/{org}/{repo}/{branch}/{fname}"
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", "thinclient-ads-build")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.read().decode("utf-8", errors="replace"), fname
+        except Exception:
+            continue
+    return None, None
+
+
+def md_to_slide(md_text, fallback_title, source_url, repo_meta=None):
+    """Extract a short, slide-friendly summary from a README.
+
+    Returns only:
+      - title (first H1)
+      - tagline (first paragraph, ≤200 chars)
+      - highlights (up to 5 bullet points from the first ##/top-level list)
+      - topics (passed through from repo metadata)
+    No full-body HTML, no code blocks, no long lists.
+    """
+    title_match = re.search(r"^#\s+(.+)$", md_text, re.MULTILINE)
+    title = title_match.group(1).strip() if title_match else fallback_title
+
+    # Tagline: first non-empty paragraph that isn't a heading or badge
+    tagline = ""
+    lines = md_text.splitlines()
+    paragraph = []
+    for line in lines[1:]:  # skip the H1
+        stripped = line.strip()
+        if not stripped:
+            if paragraph:
+                break
+            continue
+        if stripped.startswith("#"):
+            if paragraph:
+                break
+            continue
+        if stripped.startswith("!") or stripped.startswith("["):
+            # Skip badge-only lines at the top
+            if not paragraph:
+                continue
+        paragraph.append(stripped)
+    if paragraph:
+        tagline = " ".join(paragraph)
+        tagline = re.sub(r"[`*_>#]", "", tagline)
+        tagline = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", tagline)
+        tagline = tagline[:200]
+
+    # Highlights: collect up to 5 short bullets from first ## section
+    # or top-level bullet list (skip code blocks entirely).
+    highlights = []
+    in_code = False
+    seen_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        # First ## — start collecting bullets only from this point
+        if stripped.startswith("## "):
+            section = stripped[3:].strip()
+            # Skip generic sections we don't want as highlights
+            if section.lower() in ("installation", "install", "requirements",
+                                    "license", "contributing", "changelog",
+                                    "credits", "acknowledgments",
+                                    "usage", "examples", "example",
+                                    "configuration", "options",
+                                    "building", "build", "compilation",
+                                    "testing", "test", "tests",
+                                    "documentation", "docs",
+                                    "support", "contact", "author",
+                                    "disclaimer", "legal",
+                                    "table of contents", "toc",
+                                    "description", "overview",
+                                    "introduction", "intro"):
+                seen_section = True
+                continue
+            seen_section = True
+        elif stripped.startswith("- ") or stripped.startswith("* "):
+            if len(highlights) < 5 and seen_section or (seen_section is False and len(highlights) < 5):
+                bullet = stripped[2:].strip()
+                # Strip markdown links/formatting
+                bullet = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", bullet)
+                bullet = re.sub(r"[`*_]", "", bullet)
+                bullet = bullet[:120]
+                if bullet and not bullet.lower().startswith(("http", "www.", "npm ", "pip ", "apt ", "dnf ", "yarn ")):
+                    # Skip headers-like bullets (single word, title-case, ends with :)
+                    if not (len(bullet) < 40 and bullet.endswith(":")):
+                        highlights.append(bullet)
+
+    body_html = ""
+    if highlights:
+        items = "\n".join(f"<li>{html.escape(h)}</li>" for h in highlights)
+        body_html += f"<ul class=\"slide-highlights\">{items}</ul>"
+
+    return {
+        "title": html.escape(title),
+        "description": "",  # populated from GitHub API metadata if available
+        "tagline": html.escape(tagline),
+        "highlights": highlights,
+        "body": body_html,
+        "url": source_url,
+        "_meta": repo_meta or {},
+    }
+
+
+def parse_repo_local(readme_path, repo_dir):
+    if not os.path.isfile(readme_path):
+        return None
+    with open(readme_path, "r", encoding="utf-8", errors="replace") as f:
+        md_text = f.read()
+
+    url = ""
+    git_cfg = os.path.join(repo_dir, ".git", "config")
+    if os.path.isfile(git_cfg):
+        with open(git_cfg, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = re.match(r"^\s*url\s*=\s*(.+)$", line)
+                if m:
+                    url = m.group(1).strip()
+                    break
+
+    return md_to_slide(md_text, Path(repo_dir).name, html.escape(url))
+
+
+def parse_repo_remote(org, repo_name, branch, token=""):
+    md_text, _ = fetch_readme_raw(org, repo_name, branch, token)
+    if not md_text:
+        return None
+    url = f"https://github.com/{org}/{repo_name}"
+    return md_to_slide(md_text, repo_name, url)
+
+
+# ─── HTML/CSS/JS templates ───────────────────────────────────────────────────
+
+CSS = """
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+    height: 100vh;
+    overflow: hidden;
+    background: #0b0f17;
+    color: #e6edf3;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+}
+.carousel {
+    width: 100vw;
+    height: 100vh;
+    position: relative;
+    overflow: hidden;
+}
+.slide {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    opacity: 0;
+    transition: opacity 0.8s ease-in-out;
+    padding: 80px 120px;
+    flex-direction: column;
+    justify-content: center;
+    background: linear-gradient(135deg, #0b0f17 0%, #131922 60%, #1a2230 100%);
+}
+.slide.active { opacity: 1; }
+.slide-header {
+    display: flex;
+    align-items: baseline;
+    gap: 28px;
+    margin-bottom: 24px;
+}
+.slide-title {
+    font-size: 56px;
+    font-weight: 800;
+    letter-spacing: -0.025em;
+    color: #58a6ff;
+    line-height: 1.05;
+}
+.slide-meta {
+    display: flex;
+    gap: 20px;
+    font-size: 16px;
+    color: #7d8590;
+    margin-top: 6px;
+}
+.slide-meta span {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.slide-url {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    color: #7d8590;
+    margin-bottom: 28px;
+}
+.slide-tagline {
+    font-size: 22px;
+    color: #c9d1d9;
+    line-height: 1.45;
+    margin-bottom: 28px;
+    max-width: 900px;
+}
+.slide-highlights {
+    list-style: none;
+    margin-top: 8px;
+    padding: 0;
+}
+.slide-highlights li {
+    font-size: 17px;
+    color: #b1bac4;
+    padding: 6px 0;
+    padding-left: 28px;
+    position: relative;
+    line-height: 1.4;
+}
+.slide-highlights li::before {
+    content: "▸";
+    position: absolute;
+    left: 0;
+    color: #58a6ff;
+    font-weight: 700;
+}
+/* Pagination indicator */
+.carousel-nav {
+    position: fixed;
+    bottom: 24px;
+    right: 32px;
+    display: flex;
+    gap: 8px;
+    z-index: 10;
+}
+.dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #2a3441;
+    transition: background 0.3s;
+}
+.dot.active { background: #58a6ff; }
+/* Org branding */
+.org-badge {
+    position: fixed;
+    top: 24px;
+    right: 32px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: #7d8590;
+    z-index: 10;
+}
+.org-badge a { color: #58a6ff; text-decoration: none; }
+/* No-ads fallback */
+.fallback {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    color: #7d8590;
+    font-size: 22px;
+    font-weight: 300;
+    letter-spacing: 0.04em;
+    text-align: center;
+    flex-direction: column;
+    gap: 12px;
+}
+"""
+
+
+JS_TEMPLATE = """
+const slides = document.querySelectorAll('.slide');
+const dots = document.querySelectorAll('.dot');
+const interval = {rotate_ms};
+let idx = 0;
+if (slides.length > 0) {{
+    slides[0].classList.add('active');
+    if (dots.length > 0) dots[0].classList.add('active');
+    if (slides.length > 1) {{
+        setInterval(() => {{
+            slides[idx].classList.remove('active');
+            if (dots[idx]) dots[idx].classList.remove('active');
+            idx = (idx + 1) % slides.length;
+            slides[idx].classList.add('active');
+            if (dots[idx]) dots[idx].classList.add('active');
+        }}, interval);
+    }}
+}}
+"""
+
+
+def build_html(projects, rotate_sec, org="IT-Kuny"):
+    if not projects:
+        body = '<div class="fallback">No project READMEs found.<br>Configure /etc/thinclient/ads.conf</div>'
+        dots = ""
+    else:
+        slides = []
+        for p in projects:
+            meta = p.get("_meta", {})
+            meta_html = ""
+            if meta.get("language"):
+                meta_html += f'<span>💻 {html.escape(meta["language"])}</span>'
+            if meta.get("stars", 0) > 0:
+                meta_html += f'<span>⭐ {meta["stars"]}</span>'
+
+            # Prefer GitHub metadata description if slide tagline is empty
+            tagline = p.get('tagline') or meta.get('description') or ''
+            if not tagline and meta.get('description'):
+                tagline = meta['description']
+
+            slide = f"""<section class="slide">
+    <header class="slide-header">
+        <h1 class="slide-title">{p['title']}</h1>
+        {f'<div class="slide-meta">{meta_html}</div>' if meta_html else ''}
+    </header>
+    {f'<div class="slide-url">{p["url"]}</div>' if p['url'] else ''}
+    {f'<p class="slide-tagline">{html.escape(tagline[:200])}</p>' if tagline else ''}
+    {p['body']}
+</section>"""
+            slides.append(slide)
+        dots = '<div class="carousel-nav">' + "".join(
+            f'<div class="dot"></div>' for _ in projects
+        ) + '</div>'
+        body = "\n".join(slides)
+
+    org_badge = f'<div class="org-badge">github.com/<a href="https://github.com/{org}">{org}</a></div>'
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{org} — ThinClient Kiosk</title>
+<style>{CSS}</style>
+</head>
+<body>
+<div class="carousel">
+{body}
+</div>
+{dots}
+{org_badge}
+<script>{JS_TEMPLATE.format(rotate_ms=rotate_sec * 1000)}</script>
+</body>
+</html>
+"""
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Build ThinClient ad page from GitHub org READMEs")
+    ap.add_argument("-c", "--config", default=DEFAULT_CONFIG)
+    ap.add_argument("-o", "--output", default=DEFAULT_OUTPUT)
+    ap.add_argument("--org", help="GitHub organization (overrides config)")
+    ap.add_argument("--local-only", action="store_true",
+                    help="Skip GitHub fetch, use only local repos from config")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    org = args.org or cfg["org"]
+    rotate = cfg["rotate"]
+    token = cfg["token"] or os.environ.get("GITHUB_TOKEN", "")
+    local_repos = cfg["repos"]
+
+    projects = []
+
+    # Remote: fetch all repos from GitHub org
+    if not args.local_only and org:
+        print(f"fetching public repos for org '{org}'...")
+        repos = fetch_org_repos(org, token,
+                                include_forked=cfg["include_forked"],
+                                include_archived=cfg["include_archived"])
+        print(f"  {len(repos)} public repos (excluding forks/archived as configured)")
+        for r in repos:
+            slide = parse_repo_remote(org, r["name"], r["default_branch"], token)
+            if slide:
+                # Use GitHub description if slide tagline is empty
+                if r["description"] and not slide.get("tagline"):
+                    slide["tagline"] = html.escape(r["description"][:200])
+                slide["_meta"] = {
+                    "stars": r["stars"],
+                    "language": r["language"],
+                    "topics": r["topics"],
+                    "description": r["description"],
+                }
+                projects.append(slide)
+                print(f"  ✓ {r['name']:<35}  (tagline={len(slide.get('tagline', ''))}c, highlights={len(slide.get('highlights', []))})")
+            else:
+                print(f"  – {r['name']:<35}  (no README)", file=sys.stderr)
+
+    # Local: also include explicitly configured repos
+    for repo in local_repos:
+        repo = os.path.expanduser(repo)
+        for name in ("README.md", "README.md", "readme.md"):
+            readme = os.path.join(repo, name)
+            if os.path.isfile(readme):
+                p = parse_repo_local(readme, repo)
+                if p:
+                    projects.append(p)
+                    print(f"  ✓ local: {repo}/{name}  ({len(p['body'])} bytes)")
+                break
+
+    if not projects:
+        print("WARNING: no READMEs found — generating fallback page", file=sys.stderr)
+
+    html_doc = build_html(projects, rotate, org=org)
+
+    out_dir = os.path.dirname(args.output)
+    os.makedirs(out_dir, exist_ok=True)
+    tmp = args.output + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(html_doc)
+    os.replace(tmp, args.output)
+    print(f"OK: wrote {args.output} ({len(html_doc)} bytes, {len(projects)} project(s))")
+
+
+if __name__ == "__main__":
+    main()
