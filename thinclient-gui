@@ -114,12 +114,15 @@ print(json.dumps(vms))
 
     echo "Available VMs (checking SPICE ...)"
     echo ""
+    echo "  Long list? Scroll in the table with arrows/PgUp/PgDn, 'q' to continue."
     printf "  %-6s %-30s %-15s %-10s %s\n" "VMID" "Name" "Node" "Status" "SPICE"
     printf "  %s\n" "--------------------------------------------------------------"
 
     local vm_list_oobe=""
+    printf "  "
     while IFS= read -r line; do
         local vmid node name status
+        printf "."
         vmid=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('vmid','?'))")
         node=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('node','?'))")
         name=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('name','(no name)'))")
@@ -140,7 +143,6 @@ elif 'spice' in str(d.get('args', '')):
 else:
     print('✗ No SPICE')
 " 2>/dev/null || echo "? unknown")
-        printf "  %-6s %-30s %-15s %-10s %s\n" "$vmid" "$name" "$node" "$status" "$spice"
         vm_list_oobe+="$vmid|$name|$node|$spice"$'\n'
     done < <(echo "$vms_json" | python3 -c "
 import sys, json
@@ -148,6 +150,9 @@ for vm in json.load(sys.stdin):
     print(json.dumps(vm))
 ")
     echo ""
+    # Page the VM table — fullscreen xterm scrolls the whole table away otherwise
+    printf "%s" "$vm_list_oobe" | column -t -s"|" | less -X -P "VM list — arrows/PgUp/PgDn scroll, q to continue"
+
     read -rp "Save credentials for automatic login next time? [y/N]: " save_yn
     if [[ "${save_yn,,}" == "y" ]]; then
         cat > "$CRED_FILE" <<EOF
@@ -351,6 +356,15 @@ _select_vm_interactive() {
     fi
 }
 
+_dlg_size() {
+    # Sets DLG_W/DLG_H to fit the current screen (fallback 1280x800)
+    local dims
+    dims=$(xdpyinfo 2>/dev/null | awk '/dimensions:/{print $2}')
+    DLG_W="${dims%x*}"; DLG_H="${dims#*x}"
+    [[ "$DLG_W" =~ ^[0-9]+$ ]] || DLG_W=1280
+    [[ "$DLG_H" =~ ^[0-9]+$ ]] || DLG_H=800
+}
+
 _render_vm_picker() {
     local include_offline="$1"
 
@@ -386,11 +400,14 @@ for v in data:
     if v.get('status') not in ('running','stopped'):
         continue
     node_online = v.get('node') in online
-    if not node_online and not include_offline:
-        continue
+    if not include_offline:
+        # Default view: running VMs on online nodes only — short list,
+        # fits the picker without scrolling.
+        if v.get('status') != 'running' or not node_online:
+            continue
     v['_node_online'] = node_online
     vms.append(v)
-vms.sort(key=lambda x: x.get('vmid', 0))
+vms.sort(key=lambda x: (x.get('status') != 'running', x.get('vmid', 0)))
 print(json.dumps(vms))
 " 2>/dev/null)
     if [[ -z "$vms_json" || "$vms_json" == "[]" ]]; then
@@ -399,21 +416,29 @@ print(json.dumps(vms))
         die "$msg\n\nCheck your Proxmox permissions."
     fi
 
-    # Build zenity rows
+    # Pre-check SPICE capability for all VMs in parallel (8 concurrent).
+    # Sequential per-VM curls kept the picker away for several seconds.
+    local spice_dir
+    spice_dir=$(mktemp -d)
+    export TICKET CSRF PROXY
+    export -f check_spice 2>/dev/null || true
+    echo "$vms_json" | python3 -c "
+import sys, json
+for vm in json.load(sys.stdin):
+    print(vm.get('vmid'), vm.get('node'))
+" | xargs -P 8 -n 2 bash -c 'check_spice "$0" "$1" > "'"$spice_dir"'/$0" 2>/dev/null' || true
+    export -n TICKET CSRF PROXY 2>/dev/null || true
+
+    # Build zenity rows — single python pass (per-field python calls
+    # cost ~0.16s per row: 6 spawns × N VMs)
     local zenity_rows=()
     local node_map=""
-    while IFS= read -r line; do
-        local vmid node name status ram spice_status node_online
-        vmid=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('vmid','?'))")
-        node=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('node','?'))")
-        name=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('name','(no name)'))")
-        status=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status','?'))")
-        ram=$(echo "$line"  | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('maxmem',0)//(1024**3))")
-        node_online=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('_node_online',True))")
+    local vmid node name status ram spice_status node_online
+    while IFS="	" read -r vmid node name status ram node_online; do
 
         # Skip SPICE check for offline nodes (would hang on curl timeout)
         if [[ "$node_online" == "True" ]]; then
-            spice_status=$(check_spice "$vmid" "$node")
+            spice_status=$(cat "$spice_dir/$vmid" 2>/dev/null || echo "?")
             [[ "$spice_status" == "yes" ]] && spice_label="✓ SPICE" || spice_label="✗ No SPICE"
             node_label="$node"
         else
@@ -422,35 +447,48 @@ print(json.dumps(vms))
             status="node-down"
         fi
 
-        zenity_rows+=("$vmid" "$name" "$node_label" "$status" "${ram}GB" "$spice_label")
+        zenity_rows+=("FALSE" "$vmid" "$name" "$node_label" "$status" "${ram}GB" "$spice_label")
         node_map+="$vmid $node"$'\n'
     done < <(echo "$vms_json" | python3 -c "
 import sys, json
 for vm in json.load(sys.stdin):
-    print(json.dumps(vm))
+    print('%s\t%s\t%s\t%s\t%d\t%s' % (
+        vm.get('vmid','?'), vm.get('node','?'), vm.get('name','(no name)'),
+        vm.get('status','?'), vm.get('maxmem',0)//(1024**3),
+        vm.get('_node_online',True)))
 ")
 
     local toggle_label
     if [[ "$include_offline" == "1" ]]; then
-        toggle_label="Hide offline nodes"
+        toggle_label="Running VMs only"
     else
-        toggle_label="Show offline nodes"
+        toggle_label="Show all VMs"
     fi
 
-    local text="Select a VM to connect to:"
-    [[ "$include_offline" == "1" ]] && text="Select a VM to connect to (including offline nodes):"
+    local text="Select a running VM to connect to:"
+    [[ "$include_offline" == "1" ]] && text="Select a VM to connect to (all VMs, incl. stopped/offline nodes):"
+
+    # Adaptive size: fit screen, but at least a dozen rows visible
+    _dlg_size
+    local nrows=$(( ${#zenity_rows[@]} / 7 ))
+    local dlg_h=$(( nrows * 26 + 190 ))
+    local dlg_w=1080
+    (( dlg_h > DLG_H - 60 )) && dlg_h=$(( DLG_H - 60 ))
+    (( dlg_h < 340 )) && dlg_h=340
+    (( dlg_w > DLG_W - 40 )) && dlg_w=$(( DLG_W - 40 ))
 
     local chosen
-    chosen=$(zenity --list \
+    chosen=$(zenity --list --radiolist \
         --title="$TITLE" \
         --text="$text" \
+        --column="Select" \
         --column="VM ID" \
         --column="Name" \
         --column="Node" \
         --column="Status" \
         --column="RAM" \
         --column="Display" \
-        --width=1080 --height=720 \
+        --width=$dlg_w --height=$dlg_h \
         --extra-button="$toggle_label" \
         "${zenity_rows[@]}" 2>/dev/null)
     local zrc=$?
@@ -462,6 +500,8 @@ for vm in json.load(sys.stdin):
         fi
         return 1
     fi
+
+    rm -rf "$spice_dir" 2>/dev/null || true
 
     [[ -z "$chosen" ]] && return 1
     VMID="$chosen"
@@ -550,6 +590,16 @@ _guest_ping() {
         >/dev/null 2>&1
 }
 
+_vm_ostype() {
+    # Returns PVE ostype (e.g. l26, win11, other) — empty on error
+    local vmid="$1" node="$2"
+    curl -f -s -S -k \
+        -b "PVEAuthCookie=$TICKET" \
+        -H "CSRFPreventionToken=$CSRF" \
+        "https://$PROXY:8006/api2/json/nodes/$node/qemu/$vmid/config" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('ostype',''))" 2>/dev/null
+}
+
 _vm_status() {
     local vmid="$1" node="$2"
     curl -f -s -S -k \
@@ -569,12 +619,25 @@ _start_ads_kiosk() {
         return 0
     }
 
+    local ads_url="file://$ADS_INDEX"
+    if curl -s -m 1 -o /dev/null "http://127.0.0.1:8765/"; then
+        ads_url="http://127.0.0.1:8765/"
+    fi
     if [[ -f "$ADS_INDEX" ]]; then
-        # Use --start-fullscreen instead of --kiosk so the window is
-        # WM-managed (openbox can place zenity above it).
+        # Use --start-maximized (NOT --start-fullscreen/--kiosk):
+        # a client-requested EWMH fullscreen window sits above ALL layers
+        # in openbox, hiding the picker. Maximized + undecorated (openbox
+        # rc.xml rule) looks identical but respects layer=below.
         # --kiosk sets override-redirect which bypasses openbox entirely.
-        "$browser" \
-            --start-fullscreen \
+        #
+        # Launched nice'd and slightly deferred: chromium startup would
+        # starve the CPU on thin clients and delay the VM picker by
+        # several seconds. The picker renders at full speed; the browser
+        # builds up behind it (openbox layer rule keeps dialogs on top).
+        ( sleep 6
+          exec nice -n 19 "$browser" \
+            --start-maximized \
+            --window-position=0,0 \
             --incognito \
             --noerrdialogs \
             --disable-translate \
@@ -586,7 +649,8 @@ _start_ads_kiosk() {
             --no-sandbox \
             --disable-gpu \
             --overscroll-history-navigation=0 \
-            "file://$ADS_INDEX" >>"$CONFIG_DIR/kiosk.log" 2>&1 &
+            "$ads_url" >>"$CONFIG_DIR/kiosk.log" 2>&1
+        ) >/dev/null 2>&1 &
         echo $!
         return 0
     fi
@@ -674,104 +738,131 @@ vm_ensure_running() {
         sleep 1
     done
 
-    _emit_phase 35 "VM running. Waiting for guest agent..."
-    # Phase 3: Wait for guest agent
+    _emit_phase 35 "VM running. Checking guest agent..."
+    # Phase 3: Probe guest agent (short window). macOS/agentless guests
+    # have no qemu-guest-agent at all — boot introspection is impossible.
+    local agent_ok=0
     t0=$SECONDS
     while ! _guest_ping "$vmid" "$node"; do
-        if (( SECONDS - t0 > 60 )); then
-            sleep 20
+        if (( SECONDS - t0 > 20 )); then
             break
         fi
         sleep 1
     done
+    _guest_ping "$vmid" "$node" && agent_ok=1
 
-    _emit_phase 55 "Guest agent ready. Waiting for Xorg..."
-    # Phase 4: Wait for Xorg process inside VM
-    t0=$SECONDS
-    local xorg_ok=0
-    while true; do
-        local rc
-        rc=$(_guest_exec "$vmid" "$node" pgrep -x Xorg 2>/dev/null)
-        if [[ "$rc" == "0" ]]; then
-            xorg_ok=1
-            break
-        fi
-        if (( SECONDS - t0 > 45 )); then
-            break
-        fi
-        sleep 1
-    done
+    local ostype
+    ostype=$(_vm_ostype "$vmid" "$node")
+    local is_linux=0
+    [[ "$ostype" == l* ]] && is_linux=1
+    # Linux guests: l26 etc. Windows: win*. Other/macOS: "other" or empty.
 
-    _emit_phase 75 "Xorg is up. Waiting for display manager..."
-    # Phase 5: Wait for display manager service active
-    t0=$SECONDS
-    local dm_ok=0
-    while true; do
-        local rc
-        rc=$(_guest_exec "$vmid" "$node" systemctl is-active --quiet lightdm 2>/dev/null)
-        if [[ "$rc" == "0" ]]; then
-            dm_ok=1
-            break
-        fi
-        rc=$(_guest_exec "$vmid" "$node" systemctl is-active --quiet gdm 2>/dev/null)
-        if [[ "$rc" == "0" ]]; then
-            dm_ok=1
-            break
-        fi
-        if (( SECONDS - t0 > 30 )); then
-            break
-        fi
-        sleep 1
-    done
+    local xorg_ok=1   # default: no warning (non-introspectable guests)
 
-    _emit_phase 85 "Display manager active. Waiting for login..."
+    if [[ "$agent_ok" != "1" ]]; then
+        # No guest agent (macOS, appliance, agentless): cannot introspect.
+        # Give the display a grace period, then open SPICE directly.
+        _emit_phase 55 "No guest agent — waiting for display to come up..."
+        local grace=15
+        [[ "$is_linux" == "1" ]] && grace=25
+        sleep "$grace"
+        _emit_phase 95 "Opening SPICE connection..."
+    elif [[ "$is_linux" != "1" ]]; then
+        # Agent present but non-Linux guest (Windows/macOS-type):
+        # no Xorg/systemd to look for. Agent up = booted enough.
+        _emit_phase 55 "Guest agent ready. Non-Linux guest — skipping X checks..."
+        sleep 5
+        _emit_phase 95 "Login screen should be ready. Opening SPICE connection..."
+    else
+        # Linux + agent: full boot introspection (Xorg → DM → login)
+        _emit_phase 55 "Guest agent ready. Waiting for Xorg..."
+        # Phase 4: Wait for Xorg process inside VM
+        t0=$SECONDS
+        xorg_ok=0
+        while true; do
+            local rc
+            rc=$(_guest_exec "$vmid" "$node" pgrep -x Xorg 2>/dev/null)
+            if [[ "$rc" == "0" ]]; then
+                xorg_ok=1
+                break
+            fi
+            if (( SECONDS - t0 > 45 )); then
+                break
+            fi
+            sleep 1
+        done
 
-    # Phase 6: Mode-dependent wait.
-    # AUTO_VM_LOGIN=1 + matching user config → wait for actual session
-    # Default → wait for greeter to be visible
-    local auto_vm=0
-    [[ -f "$CRED_FILE" ]] && grep -q '^AUTO_VM_LOGIN=1' "$CRED_FILE" && auto_vm=1
+        _emit_phase 75 "Xorg is up. Waiting for display manager..."
+        # Phase 5: Wait for display manager service active
+        t0=$SECONDS
+        local dm_ok=0
+        while true; do
+            local rc
+            rc=$(_guest_exec "$vmid" "$node" systemctl is-active --quiet lightdm 2>/dev/null)
+            if [[ "$rc" == "0" ]]; then
+                dm_ok=1
+                break
+            fi
+            rc=$(_guest_exec "$vmid" "$node" systemctl is-active --quiet gdm 2>/dev/null)
+            if [[ "$rc" == "0" ]]; then
+                dm_ok=1
+                break
+            fi
+            if (( SECONDS - t0 > 30 )); then
+                break
+            fi
+            sleep 1
+        done
 
-    t0=$SECONDS
-    local login_ok=0
-    while true; do
-        local rc
+        _emit_phase 85 "Display manager active. Waiting for login..."
+
+        # Phase 6: Mode-dependent wait.
+        # AUTO_VM_LOGIN=1 + matching user config → wait for actual session
+        # Default → wait for greeter to be visible
+        local auto_vm=0
+        [[ -f "$CRED_FILE" ]] && grep -q '^AUTO_VM_LOGIN=1' "$CRED_FILE" && auto_vm=1
+
+        t0=$SECONDS
+        local login_ok=0
+        while true; do
+            local rc
+
+            if [[ "$auto_vm" == "1" ]]; then
+                # Autologin mode: wait for desktop session process
+                rc=$(_guest_exec "$vmid" "$node" pgrep -x startlxde 2>/dev/null)
+                [[ "$rc" == "0" ]] && { login_ok=1; break; }
+                rc=$(_guest_exec "$vmid" "$node" pgrep -f gnome-session 2>/dev/null)
+                [[ "$rc" == "0" ]] && { login_ok=1; break; }
+                rc=$(_guest_exec "$vmid" "$node" pgrep -f xfce4-session 2>/dev/null)
+                [[ "$rc" == "0" ]] && { login_ok=1; break; }
+                rc=$(_guest_exec "$vmid" "$node" pgrep -f plasmashell 2>/dev/null)
+                [[ "$rc" == "0" ]] && { login_ok=1; break; }
+            else
+                # Manual login mode: wait for greeter process to be visible
+                rc=$(_guest_exec "$vmid" "$node" pgrep -x lightdm-gtk-greeter 2>/dev/null)
+                [[ "$rc" == "0" ]] && { login_ok=1; break; }
+                rc=$(_guest_exec "$vmid" "$node" pgrep -f lightdm 2>/dev/null)
+                [[ "$rc" == "0" ]] && { login_ok=1; break; }
+                rc=$(_guest_exec "$vmid" "$node" pgrep -f gdm 2>/dev/null)
+                [[ "$rc" == "0" ]] && { login_ok=1; break; }
+                rc=$(_guest_exec "$vmid" "$node" pgrep -f sddm 2>/dev/null)
+                [[ "$rc" == "0" ]] && { login_ok=1; break; }
+            fi
+
+            if (( SECONDS - t0 > 30 )); then
+                break
+            fi
+            sleep 1
+        done
 
         if [[ "$auto_vm" == "1" ]]; then
-            # Autologin mode: wait for desktop session process
-            rc=$(_guest_exec "$vmid" "$node" pgrep -x startlxde 2>/dev/null)
-            [[ "$rc" == "0" ]] && { login_ok=1; break; }
-            rc=$(_guest_exec "$vmid" "$node" pgrep -f gnome-session 2>/dev/null)
-            [[ "$rc" == "0" ]] && { login_ok=1; break; }
-            rc=$(_guest_exec "$vmid" "$node" pgrep -f xfce4-session 2>/dev/null)
-            [[ "$rc" == "0" ]] && { login_ok=1; break; }
-            rc=$(_guest_exec "$vmid" "$node" pgrep -f plasmashell 2>/dev/null)
-            [[ "$rc" == "0" ]] && { login_ok=1; break; }
+            _emit_phase 95 "Desktop session ready. Opening SPICE connection..."
         else
-            # Manual login mode: wait for greeter process to be visible
-            rc=$(_guest_exec "$vmid" "$node" pgrep -x lightdm-gtk-greeter 2>/dev/null)
-            [[ "$rc" == "0" ]] && { login_ok=1; break; }
-            rc=$(_guest_exec "$vmid" "$node" pgrep -f lightdm 2>/dev/null)
-            [[ "$rc" == "0" ]] && { login_ok=1; break; }
-            rc=$(_guest_exec "$vmid" "$node" pgrep -f gdm 2>/dev/null)
-            [[ "$rc" == "0" ]] && { login_ok=1; break; }
-            rc=$(_guest_exec "$vmid" "$node" pgrep -f sddm 2>/dev/null)
-            [[ "$rc" == "0" ]] && { login_ok=1; break; }
+            _emit_phase 95 "Login screen ready. Opening SPICE connection..."
         fi
-
-        if (( SECONDS - t0 > 30 )); then
-            break
-        fi
-        sleep 1
-    done
-
-    if [[ "$auto_vm" == "1" ]]; then
-        _emit_phase 95 "Desktop session ready. Opening SPICE connection..."
-    else
-        _emit_phase 95 "Login screen ready. Opening SPICE connection..."
     fi
-    sleep 1
 
+    sleep 1
     _emit_phase 100 "Connected."
     # Teardown local progress dialog (browser stays alive)
     exec 9>&-
@@ -779,7 +870,7 @@ vm_ensure_running() {
     kill "$status_pid" 2>/dev/null || true
     wait "$status_pid" 2>/dev/null || true
 
-    if [[ "$xorg_ok" != "1" ]]; then
+    if [[ "$xorg_ok" != "1" && "$agent_ok" == "1" && "$is_linux" == "1" ]]; then
         zenity --warning \
             --title="$TITLE" \
             --text="VM is running but Xorg was not detected.\nSPICE connection may fail." \
@@ -952,6 +1043,10 @@ connect_spice() {
         return 1
     fi
 
+    # Connection established — stop the ads browser for the session duration.
+    # It only comes back after the SPICE session ends (post-session menu).
+    _kill_pid_tree "$KIOSK_PID" 2>/dev/null || true
+
     remote-viewer -f "$spice_file"
     local rv_exit=$?
     rm -f "$spice_file"
@@ -995,17 +1090,24 @@ post_session() {
         text="VM session ended.\nWhat would you like to do?"
     fi
 
+    _dlg_size
+    local dlg_h=$(( DLG_H - 120 )); (( dlg_h > 400 )) && dlg_h=400
+    local dlg_w=560; (( dlg_w > DLG_W - 40 )) && dlg_w=$(( DLG_W - 40 ))
+
+    # Session ended — bring the ads browser back as backdrop
+    KIOSK_PID=$(_start_ads_kiosk)
+
     local choice
     choice=$(zenity --list \
         --title="$TITLE" \
         --text="$text" \
         --column="Action" \
-        "Connect to another VM" \
+        "Show VM list (connect)" \
         "Logout" \
-        --width=1080 --height=720 2>/dev/null) || choice="Logout"
+        --width=$dlg_w --height=$dlg_h 2>/dev/null) || choice="Logout"
 
     case "$choice" in
-        "Connect to another VM")
+        "Show VM list (connect)")
             authenticate
             select_vm
             connect_spice
@@ -1020,6 +1122,17 @@ post_session() {
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
+    # --picker: button-triggered from the ads page (ads-server
+    # POST /open-picker). Browser is already running (owned by the main
+    # instance) — only run auth + picker + SPICE connect.
+    if [[ "$1" == "--picker" ]]; then
+        [[ -f "$CRED_FILE" ]] && load_credentials
+        authenticate || exit 1
+        select_vm || exit 0
+        connect_spice
+        exit $?
+    fi
+
     # --oobe flag: called from xterm on first launch
     if [[ "$1" == "--oobe" ]]; then
         oobe_setup
@@ -1055,9 +1168,6 @@ main() {
         _kill_pid_tree "$KIOSK_PID"
     }
     trap _trap_kiosk EXIT INT TERM
-
-    # Give browser a moment to take the screen before zenity dialogs appear
-    sleep 1
 
     authenticate
     select_vm

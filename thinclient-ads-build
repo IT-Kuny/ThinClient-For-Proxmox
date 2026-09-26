@@ -40,6 +40,24 @@ GITHUB_API = "https://api.github.com"
 GITHUB_RAW = "https://raw.githubusercontent.com"
 
 
+ALERT_RE = re.compile(r"^\s*\[!(NOTE|TIP|CAUTION|WARNING|IMPORTANT|TODO)\]", re.IGNORECASE)
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def clean_text(text, limit):
+    """Unescape entities, strip HTML tags + markdown alerts, cut at word boundary."""
+    text = html.unescape(text)
+    text = ALERT_RE.sub("", text)
+    text = HTML_TAG_RE.sub(" ", text)
+    text = re.sub(r"`*_>#", " ", text)
+    text = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", text)   # md links -> text
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        cut = text[:limit].rsplit(" ", 1)[0]
+        text = (cut + "…") if len(text) > limit else text
+    return text
+
+
 def load_config(path):
     cfg = {
         "org": DEFAULT_ORG,
@@ -151,8 +169,9 @@ def md_to_slide(md_text, fallback_title, source_url, repo_meta=None):
       - topics (passed through from repo metadata)
     No full-body HTML, no code blocks, no long lists.
     """
-    title_match = re.search(r"^#\s+(.+)$", md_text, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else fallback_title
+    # Title = repo name (README H1s are often section headings like
+    # "Install (as root)" — not a useful slide title)
+    title = fallback_title
 
     # Tagline: first non-empty paragraph that isn't a heading or badge
     tagline = ""
@@ -168,16 +187,14 @@ def md_to_slide(md_text, fallback_title, source_url, repo_meta=None):
             if paragraph:
                 break
             continue
-        if stripped.startswith("!") or stripped.startswith("["):
-            # Skip badge-only lines at the top
-            if not paragraph:
-                continue
+        if not paragraph and (stripped.startswith(("!", "[", "<", "|")) or ALERT_RE.match(stripped)):
+            # Skip badge/HTML-table/alert lines at the top
+            continue
+        if ALERT_RE.match(stripped):
+            continue
         paragraph.append(stripped)
     if paragraph:
-        tagline = " ".join(paragraph)
-        tagline = re.sub(r"[`*_>#]", "", tagline)
-        tagline = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", tagline)
-        tagline = tagline[:200]
+        tagline = clean_text(" ".join(paragraph), 200)
 
     # Highlights: collect up to 5 short bullets from first ## section
     # or top-level bullet list (skip code blocks entirely).
@@ -194,30 +211,27 @@ def md_to_slide(md_text, fallback_title, source_url, repo_meta=None):
         # First ## — start collecting bullets only from this point
         if stripped.startswith("## "):
             section = stripped[3:].strip()
-            # Skip generic sections we don't want as highlights
-            if section.lower() in ("installation", "install", "requirements",
-                                    "license", "contributing", "changelog",
-                                    "credits", "acknowledgments",
-                                    "usage", "examples", "example",
-                                    "configuration", "options",
-                                    "building", "build", "compilation",
-                                    "testing", "test", "tests",
-                                    "documentation", "docs",
-                                    "support", "contact", "author",
-                                    "disclaimer", "legal",
-                                    "table of contents", "toc",
-                                    "description", "overview",
-                                    "introduction", "intro"):
-                seen_section = True
-                continue
-            seen_section = True
-        elif stripped.startswith("- ") or stripped.startswith("* "):
-            if len(highlights) < 5 and seen_section or (seen_section is False and len(highlights) < 5):
+            # Collect bullets only from sections worth showing
+            seen_section = section.lower() not in (
+                "installation", "install", "requirements",
+                "license", "licensing", "contributing", "changelog",
+                "credits", "acknowledgments", "acknowledgements",
+                "usage", "examples", "example",
+                "configuration", "options",
+                "building", "build", "compilation",
+                "testing", "test", "tests",
+                "documentation", "docs",
+                "support", "contact", "author",
+                "disclaimer", "legal",
+                "table of contents", "toc",
+                "description", "overview",
+                "introduction", "intro")
+            continue
+        elif (stripped.startswith("- ") or stripped.startswith("* ")) and seen_section:
+            if len(highlights) < 5:
                 bullet = stripped[2:].strip()
                 # Strip markdown links/formatting
-                bullet = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", bullet)
-                bullet = re.sub(r"[`*_]", "", bullet)
-                bullet = bullet[:120]
+                bullet = clean_text(bullet, 120)
                 if bullet and not bullet.lower().startswith(("http", "www.", "npm ", "pip ", "apt ", "dnf ", "yarn ")):
                     # Skip headers-like bullets (single word, title-case, ends with :)
                     if not (len(bullet) < 40 and bullet.endswith(":")):
@@ -229,9 +243,9 @@ def md_to_slide(md_text, fallback_title, source_url, repo_meta=None):
         body_html += f"<ul class=\"slide-highlights\">{items}</ul>"
 
     return {
-        "title": html.escape(title),
+        "title": title,
         "description": "",  # populated from GitHub API metadata if available
-        "tagline": html.escape(tagline),
+        "tagline": tagline,
         "highlights": highlights,
         "body": body_html,
         "url": source_url,
@@ -255,7 +269,7 @@ def parse_repo_local(readme_path, repo_dir):
                     url = m.group(1).strip()
                     break
 
-    return md_to_slide(md_text, Path(repo_dir).name, html.escape(url))
+    return md_to_slide(md_text, Path(repo_dir).name, url)
 
 
 def parse_repo_remote(org, repo_name, branch, token=""):
@@ -381,6 +395,28 @@ html, body {
     z-index: 10;
 }
 .org-badge a { color: #58a6ff; text-decoration: none; }
+/* VM picker button */
+.picker-btn {
+    position: fixed;
+    bottom: 24px;
+    left: 32px;
+    z-index: 20;
+    padding: 14px 28px;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: #0b0f17;
+    background: #58a6ff;
+    border: none;
+    border-radius: 10px;
+    cursor: pointer;
+    box-shadow: 0 4px 16px rgba(88, 166, 255, 0.35);
+    transition: background 0.2s, transform 0.1s;
+}
+.picker-btn:hover { background: #79b8ff; }
+.picker-btn:active { transform: scale(0.97); }
+.picker-btn[disabled] { opacity: 0.6; cursor: wait; }
 /* No-ads fallback */
 .fallback {
     display: flex;
@@ -399,6 +435,20 @@ html, body {
 
 
 JS_TEMPLATE = """
+const pickerBtn = document.getElementById('picker-btn');
+if (pickerBtn) {{
+    pickerBtn.addEventListener('click', async () => {{
+        pickerBtn.disabled = true;
+        pickerBtn.textContent = 'Opening…';
+        try {{
+            await fetch('/open-picker', {{method: 'POST'}});
+        }} catch (e) {{ /* server unreachable — stay on page */ }}
+        setTimeout(() => {{
+            pickerBtn.disabled = false;
+            pickerBtn.textContent = '🖥  VM auswählen';
+        }}, 15000);
+    }});
+}}
 const slides = document.querySelectorAll('.slide');
 const dots = document.querySelectorAll('.dot');
 const interval = {rotate_ms};
@@ -440,10 +490,10 @@ def build_html(projects, rotate_sec, org="IT-Kuny"):
 
             slide = f"""<section class="slide">
     <header class="slide-header">
-        <h1 class="slide-title">{p['title']}</h1>
+        <h1 class="slide-title">{html.escape(p['title'])}</h1>
         {f'<div class="slide-meta">{meta_html}</div>' if meta_html else ''}
     </header>
-    {f'<div class="slide-url">{p["url"]}</div>' if p['url'] else ''}
+    {f'<div class="slide-url">{html.escape(p["url"])}</div>' if p['url'] else ''}
     {f'<p class="slide-tagline">{html.escape(tagline[:200])}</p>' if tagline else ''}
     {p['body']}
 </section>"""
@@ -469,6 +519,7 @@ def build_html(projects, rotate_sec, org="IT-Kuny"):
 </div>
 {dots}
 {org_badge}
+<button class="picker-btn" id="picker-btn" type="button">🖥  VM auswählen</button>
 <script>{JS_TEMPLATE.format(rotate_ms=rotate_sec * 1000)}</script>
 </body>
 </html>
@@ -504,7 +555,7 @@ def main():
             if slide:
                 # Use GitHub description if slide tagline is empty
                 if r["description"] and not slide.get("tagline"):
-                    slide["tagline"] = html.escape(r["description"][:200])
+                    slide["tagline"] = clean_text(r["description"], 200)
                 slide["_meta"] = {
                     "stars": r["stars"],
                     "language": r["language"],
@@ -516,14 +567,20 @@ def main():
             else:
                 print(f"  – {r['name']:<35}  (no README)", file=sys.stderr)
 
-    # Local: also include explicitly configured repos
+    # Local: also include explicitly configured repos (dedup vs remote by repo name)
+    seen = {p["url"].rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") for p in projects}
     for repo in local_repos:
         repo = os.path.expanduser(repo)
         for name in ("README.md", "README.md", "readme.md"):
             readme = os.path.join(repo, name)
             if os.path.isfile(readme):
+                base = Path(repo).name
+                if base in seen:
+                    print(f"  – local: {repo}  (already in deck, skipped)")
+                    break
                 p = parse_repo_local(readme, repo)
                 if p:
+                    seen.add(base)
                     projects.append(p)
                     print(f"  ✓ local: {repo}/{name}  ({len(p['body'])} bytes)")
                 break

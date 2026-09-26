@@ -17,22 +17,34 @@
     <!-- Browser kiosk (chromium / chromium-browser / google-chrome)
          Place on layer=below so all dialogs render above it. -->
     <application name="chromium">
+      <maximized>yes</maximized>
+      <decor>no</decor>
       <layer>below</layer>
     </application>
     <application name="chromium-browser">
+      <maximized>yes</maximized>
+      <decor>no</decor>
       <layer>below</layer>
     </application>
     <application name="google-chrome">
+      <maximized>yes</maximized>
+      <decor>no</decor>
       <layer>below</layer>
     </application>
     <application name="google-chrome-stable">
+      <maximized>yes</maximized>
+      <decor>no</decor>
       <layer>below</layer>
     </application>
     <!-- Match by class wildcard for any chromium-based browser -->
     <application class="Chromium*">
+      <maximized>yes</maximized>
+      <decor>no</decor>
       <layer>below</layer>
     </application>
     <application class="Google-chrome*">
+      <maximized>yes</maximized>
+      <decor>no</decor>
       <layer>below</layer>
     </application>
     <!-- Zenity dialogs — always above the browser -->

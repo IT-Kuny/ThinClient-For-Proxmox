@@ -32,7 +32,7 @@ err()  { echo -e "\e[1;31m[fail]\e[0m   $*" >&2; }
 
 # ─── 1. Binaries ─────────────────────────────────────────────────────────────
 log "installing scripts to /usr/local/bin/"
-for f in thinclient-gui thinclient-session thinclient-users thinclient-ads-build; do
+for f in thinclient-gui thinclient-session thinclient-users thinclient-ads-build thinclient-ads-server; do
     if [[ -f "$HERE/$f" ]]; then
         install -Dm755 "$HERE/$f" "/usr/local/bin/$f"
         log "  $f ✓"

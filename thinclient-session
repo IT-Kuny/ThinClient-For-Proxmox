@@ -26,6 +26,12 @@ if ! xdpyinfo &>/dev/null; then
     exit 1
 fi
 
+# Start local ads server (serves the ads page + VM-picker button endpoint)
+if [[ -x /usr/local/bin/thinclient-ads-server ]] && ! curl -s -m 1 -o /dev/null http://127.0.0.1:8765/; then
+    /usr/local/bin/thinclient-ads-server >> "$HOME/.config/thinclient/ads-server.log" 2>&1 &
+    echo "[$(date)] thinclient-ads-server started (PID $!)"
+fi
+
 # Basic X setup
 xsetroot -solid "#1a1a2e" 2>/dev/null || true
 unclutter -idle 5 -root &>/dev/null &
